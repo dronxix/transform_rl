@@ -1,0 +1,176 @@
+import os
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import ray
+from ray import tune, air, train
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.core import RLModule
+from ray.rllib.core.rl_module.rl_module import SingleAgentRLModuleSpec
+from ray.rllib.models.torch.torch_distributions import TorchDeterministic
+from ray.rllib.policy.policy import PolicySpec
+from ray.rllib.utils.annotations import override
+from ray.tune.schedulers import PopulationBasedTraining
+from torch.optim import Adam
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RLTransformer(nn.Module):
+    def __init__(self, input_dim=50, output_dim=5, hidden_dim=128, num_layers=2, num_heads=4):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim*4, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.actor_head = nn.Linear(hidden_dim, output_dim)
+        self.critic_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        x = self.input_layer(x)
+        x = self.transformer(x)
+        x = x[:, -1, :]
+        return self.actor_head(x), self.critic_head(x)
+
+class TransformerRLModule(RLModule):
+    def __init__(self, config):
+        super().__init__(config)
+        self.input_dim = config["input_dim"]
+        self.output_dim = config["output_dim"]
+        self.model = RLTransformer(
+            input_dim=self.input_dim,
+            output_dim=self.output_dim,
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            num_heads=config["num_heads"]
+        )
+
+    @override(RLModule)
+    def input_specs(self):
+        return ["obs"]
+
+    @override(RLModule)
+    def output_specs(self):
+        return ["actions"]
+
+    @override(RLModule)
+    def _forward_inference(self, batch):
+        with torch.no_grad():
+            return self._forward_train(batch)
+
+    @override(RLModule)
+    def _forward_exploration(self, batch):
+        return self._forward_train(batch)
+
+    @override(RLModule)
+    def _forward_train(self, batch):
+        obs = batch["obs"]
+        actor_out, critic_out = self.model(obs.float())
+        return {
+            "actions": actor_out,
+            "vf_preds": critic_out.squeeze(-1),
+        }
+
+    @override(RLModule)
+    def get_train_action_dist_cls(self):
+        return TorchDeterministic
+
+    @override(RLModule)
+    def get_exploration_action_dist_cls(self):
+        return TorchDeterministic
+
+class TransformerEnv(gym.Env):
+    # Оставить реализацию без изменений
+    ...
+
+def setup_training(input_dim=50, output_dim=5):
+    ray.init()
+
+    env_config = {
+        "input_dim": input_dim,
+        "output_dim": output_dim,
+        "max_steps": 100,
+        "target_reward": 10.0
+    }
+
+    pbt = PopulationBasedTraining(
+        time_attr="training_iteration",
+        metric="episode_reward_mean",
+        mode="max",
+        perturbation_interval=5,
+        hyperparam_mutations={
+            "lr": tune.choice([1e-5, 5e-5, 1e-4]),
+            "gamma": tune.choice([0.9, 0.95, 0.99]),
+            "model_config": {
+                "hidden_dim": tune.choice([64, 128, 256]),
+                "num_layers": tune.choice([1, 2]),
+                "num_heads": tune.choice([2, 4])
+            }
+        }
+    )
+
+    config = (
+        PPOConfig()
+        .environment(env="transformer_env", env_config=env_config)
+        .framework("torch")
+        .rl_module(
+            rl_module_spec=SingleAgentRLModuleSpec(
+                module_class=TransformerRLModule,
+                model_config={
+                    "input_dim": input_dim,
+                    "output_dim": output_dim,
+                    "hidden_dim": 128,
+                    "num_layers": 2,
+                    "num_heads": 4
+                }
+            )
+        )
+        .training(
+            gamma=0.99,
+            lr=3e-4,
+            use_gae=True,
+            kl_coeff=0.3,
+            _enable_learner_api=True,
+            _enable_rl_module_api=True,
+        )
+        .env_runners(
+            num_env_runners=2,
+            num_envs_per_env_runner=1,
+            rollout_fragment_length="auto",
+        )
+        .resources(num_gpus=torch.cuda.device_count())
+    )
+
+    tuner = tune.Tuner(
+        "PPO",
+        param_space=config.to_dict(),
+        tune_config=tune.TuneConfig(
+            scheduler=pbt,
+            num_samples=5,
+        ),
+        run_config=air.RunConfig(
+            name="transformer_rl_v2",
+            stop={"episode_reward_mean": 10.0},
+            checkpoint_config=air.CheckpointConfig(
+                checkpoint_frequency=5,
+                checkpoint_score_attribute="episode_reward_mean",
+                num_to_keep=3
+            ),
+            storage_path=os.path.expanduser("~/ray_results"),
+        )
+    )
+    return tuner
+
+def train_rl_transformer():
+    tuner = setup_training()
+    results = tuner.fit()
+    best_checkpoint = results.get_best_result().checkpoint
+    ray.shutdown()
+    return best_checkpoint
+
+if __name__ == "__main__":
+    checkpoint = train_rl_transformer()
+    print(f"Best checkpoint: {checkpoint}")
