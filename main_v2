@@ -3,27 +3,29 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import ray
-from ray import tune, air, train
+from ray import train, tune
+from ray.train import CheckpointConfig, RunConfig
 from ray.rllib.algorithms.ppo import PPOConfig
-from ray.rllib.core import RLModule
-from ray.rllib.core.rl_module.rl_module import SingleAgentRLModuleSpec
+from ray.rllib.core.rl_module import RLModule
+from ray.rllib.core.rl_module.rl_module import RLModuleSpec
 from ray.rllib.models.torch.torch_distributions import TorchDeterministic
-from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.utils.annotations import override
 from ray.tune.schedulers import PopulationBasedTraining
-from torch.optim import Adam
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+# Определение трансформера для RL
 class RLTransformer(nn.Module):
     def __init__(self, input_dim=50, output_dim=5, hidden_dim=128, num_layers=2, num_heads=4):
         super().__init__()
         self.input_layer = nn.Linear(input_dim, hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim*4, batch_first=True
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         self.actor_head = nn.Linear(hidden_dim, output_dim)
         self.critic_head = nn.Linear(hidden_dim, 1)
 
@@ -35,38 +37,42 @@ class RLTransformer(nn.Module):
         x = x[:, -1, :]
         return self.actor_head(x), self.critic_head(x)
 
+# Новый RLModule согласно новому API
 class TransformerRLModule(RLModule):
-    def __init__(self, config):
-        super().__init__(config)
-        self.input_dim = config["input_dim"]
-        self.output_dim = config["output_dim"]
+    def __init__(self, observation_space, action_space, model_config, inference_only=False, learner_only=False, **kwargs):
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            inference_only=inference_only,
+            learner_only=learner_only,
+            model_config=model_config
+        )
+        # Инициализируем трансформер с параметрами из model_config
         self.model = RLTransformer(
-            input_dim=self.input_dim,
-            output_dim=self.output_dim,
-            hidden_dim=config["hidden_dim"],
-            num_layers=config["num_layers"],
-            num_heads=config["num_heads"]
+            input_dim=model_config.get("input_dim", 50),
+            output_dim=model_config.get("output_dim", 5),
+            hidden_dim=model_config.get("hidden_dim", 128),
+            num_layers=model_config.get("num_layers", 2),
+            num_heads=model_config.get("num_heads", 4)
         )
 
-    @override(RLModule)
-    def input_specs(self):
-        return ["obs"]
+    def to(self, device, **kwargs):
+        self.model = self.model.to(device, **kwargs)
+        return self
 
     @override(RLModule)
-    def output_specs(self):
-        return ["actions"]
+    def forward_inference(self, batch):
+        return self._forward_impl(batch)
 
     @override(RLModule)
-    def _forward_inference(self, batch):
-        with torch.no_grad():
-            return self._forward_train(batch)
+    def forward_exploration(self, batch):
+        return self._forward_impl(batch)
 
     @override(RLModule)
-    def _forward_exploration(self, batch):
-        return self._forward_train(batch)
+    def forward_train(self, batch):
+        return self._forward_impl(batch)
 
-    @override(RLModule)
-    def _forward_train(self, batch):
+    def _forward_impl(self, batch):
         obs = batch["obs"]
         actor_out, critic_out = self.model(obs.float())
         return {
@@ -82,10 +88,46 @@ class TransformerRLModule(RLModule):
     def get_exploration_action_dist_cls(self):
         return TorchDeterministic
 
+# Определение кастомной среды
 class TransformerEnv(gym.Env):
-    # Оставить реализацию без изменений
-    ...
+    def __init__(self, env_config):
+        super().__init__()
+        self.input_dim = env_config.get("input_dim", 50)
+        self.output_dim = env_config.get("output_dim", 5)
+        self.max_steps = env_config.get("max_steps", 100)
+        self.target_reward = env_config.get("target_reward", 10.0)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.input_dim,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.output_dim,), dtype=np.float32)
+        # Инициализация переменных среды
+        self.current_step = 0
+        self.total_reward = 0.0
+        self.target_vector = None
 
+    def reset(self, seed=None, options=None):
+        # Если seed передан, можно использовать его для установки генератора случайных чисел
+        self.current_step = 0
+        self.total_reward = 0.0
+        self.target_vector = np.random.uniform(-1.0, 1.0, size=(self.output_dim,)).astype(np.float32)
+        observation = np.random.normal(0, 1, size=(self.input_dim,)).astype(np.float32)
+        return observation, {}  # Gymnasium требует кортеж (obs, info)
+    
+    def step(self, action):
+        distance = np.linalg.norm(action - self.target_vector)
+        reward = -distance
+        self.total_reward += reward
+        self.current_step += 1
+        terminated = (self.current_step >= self.max_steps or self.total_reward >= self.target_reward)
+        truncated = False
+        observation = np.random.normal(0, 1, size=(self.input_dim,)).astype(np.float32)
+        info = {
+            "distance": distance,
+            "current_step": self.current_step,
+            "total_reward": self.total_reward,
+            "target_vector": self.target_vector
+        }
+        return observation, reward, terminated, truncated, info
+
+# Функция для настройки обучения.
 def setup_training(input_dim=50, output_dim=5):
     ray.init()
 
@@ -96,36 +138,46 @@ def setup_training(input_dim=50, output_dim=5):
         "target_reward": 10.0
     }
 
+    tune.register_env("transformer_env", lambda config: TransformerEnv(config))
+
+    # Убираем мутацию для "model_config", чтобы не перезаписывать защищенное свойство.
     pbt = PopulationBasedTraining(
         time_attr="training_iteration",
         metric="episode_reward_mean",
         mode="max",
         perturbation_interval=5,
         hyperparam_mutations={
-            "lr": tune.choice([1e-5, 5e-5, 1e-4]),
-            "gamma": tune.choice([0.9, 0.95, 0.99]),
-            "model_config": {
-                "hidden_dim": tune.choice([64, 128, 256]),
-                "num_layers": tune.choice([1, 2]),
-                "num_heads": tune.choice([2, 4])
-            }
+            "lr": tune.loguniform(1e-5, 1e-3),
+            "gamma": tune.uniform(0.9, 0.99)
         }
     )
 
     config = (
         PPOConfig()
-        .environment(env="transformer_env", env_config=env_config)
         .framework("torch")
+        .api_stack(
+            enable_rl_module_and_learner=True,
+            enable_env_runner_and_connector_v2=True
+        )
+        .environment(
+            env="transformer_env",
+            env_config=env_config,
+            action_space=spaces.Box(-1.0, 1.0, (output_dim,))
+        )
         .rl_module(
-            rl_module_spec=SingleAgentRLModuleSpec(
+            rl_module_spec=RLModuleSpec(
                 module_class=TransformerRLModule,
+                observation_space=spaces.Box(-np.inf, np.inf, (input_dim,), np.float32),
+                action_space=spaces.Box(-1.0, 1.0, (output_dim,), np.float32),
                 model_config={
                     "input_dim": input_dim,
                     "output_dim": output_dim,
                     "hidden_dim": 128,
                     "num_layers": 2,
-                    "num_heads": 4
-                }
+                    "num_heads": 4,
+                },
+                inference_only=False,
+                learner_only=False
             )
         )
         .training(
@@ -133,31 +185,39 @@ def setup_training(input_dim=50, output_dim=5):
             lr=3e-4,
             use_gae=True,
             kl_coeff=0.3,
-            _enable_learner_api=True,
-            _enable_rl_module_api=True,
+            vf_loss_coeff=0.5,
+            entropy_coeff=0.01
         )
         .env_runners(
             num_env_runners=2,
-            num_envs_per_env_runner=1,
             rollout_fragment_length="auto",
+            batch_mode="complete_episodes"
         )
-        .resources(num_gpus=torch.cuda.device_count())
+        .resources(
+            num_gpus=1 if torch.cuda.is_available() else 0
+        )
+        .debugging(log_level="INFO")
     )
 
+    # Получаем итоговый конфиг как словарь и удаляем ключ "model_config", если он присутствует.
+    config_dict = config.to_dict()
+    config_dict.pop("model_config", None)
+
+    # Для отладки устанавливаем условие остановки по числу итераций.
     tuner = tune.Tuner(
         "PPO",
-        param_space=config.to_dict(),
+        param_space=config_dict,
         tune_config=tune.TuneConfig(
             scheduler=pbt,
             num_samples=5,
         ),
-        run_config=air.RunConfig(
-            name="transformer_rl_v2",
-            stop={"episode_reward_mean": 10.0},
-            checkpoint_config=air.CheckpointConfig(
-                checkpoint_frequency=5,
+        run_config=RunConfig(
+            name="transformer_rl_v3",
+            stop={"training_iteration": 10},
+            checkpoint_config=CheckpointConfig(
+                num_to_keep=3,
                 checkpoint_score_attribute="episode_reward_mean",
-                num_to_keep=3
+                checkpoint_frequency=5
             ),
             storage_path=os.path.expanduser("~/ray_results"),
         )
@@ -166,11 +226,12 @@ def setup_training(input_dim=50, output_dim=5):
 
 def train_rl_transformer():
     tuner = setup_training()
-    results = tuner.fit()
-    best_checkpoint = results.get_best_result().checkpoint
+    result_grid = tuner.fit()
+    best_result = result_grid.get_best_result(metric="episode_reward_mean", mode="max", filter_nan_and_inf=False)
+    best_checkpoint = best_result.checkpoint
     ray.shutdown()
     return best_checkpoint
 
 if __name__ == "__main__":
     checkpoint = train_rl_transformer()
-    print(f"Best checkpoint: {checkpoint}")
+    print(f"Лучший чекпоинт: {checkpoint}")
