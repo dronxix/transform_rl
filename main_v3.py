@@ -473,16 +473,20 @@ def create_config():
     # Конфигурация PPO
     config = (PPOConfig()
               .environment(env=CustomEnvironment, env_config=env_config)
-              .rollouts(num_rollout_workers=2, rollout_fragment_length=200)
+              .env_runners(num_env_runners=2, rollout_fragment_length=200)
               .training(
                   train_batch_size=2000,
-                  sgd_minibatch_size=256,
-                  num_sgd_iter=10,
+                  #sgd_minibatch_size=256,
+                  #num_sgd_iter=10,
                   lr=3e-4,
-                  entropy_coeff=0.01,
-                  clip_param=0.2,
-                  vf_loss_coeff=0.5,
+                  #entropy_coeff=0.01,
+                  #clip_param=0.2,
+                  #vf_loss_coeff=0.5,
                   model=model_config
+              )
+              .api_stack(
+                  enable_rl_module_and_learner=False,
+                  enable_env_runner_and_connector_v2=False
               )
               .framework("torch")
               .debugging(log_level="INFO"))
@@ -593,16 +597,18 @@ def train_with_pbt():
     # Настройка PBT с расширенным поиском гиперпараметров
     pbt = PopulationBasedTraining(
         time_attr="training_iteration",
+        metric="episode_reward_mean",
+        mode="max",
         perturbation_interval=15,  # Увеличил интервал для стабильности
         resample_probability=0.25,  # Вероятность полной повторной выборки
         hyperparam_mutations={
             # === PPO ПАРАМЕТРЫ ===
             "lr": lambda: np.random.uniform(1e-5, 5e-3),
-            "entropy_coeff": lambda: np.random.uniform(0.001, 0.1),
-            "clip_param": lambda: np.random.uniform(0.1, 0.5),
+            #"entropy_coeff": lambda: np.random.uniform(0.001, 0.1),
+            #"clip_param": lambda: np.random.uniform(0.1, 0.5),
             "train_batch_size": lambda: np.random.choice([1000, 2000, 4000, 8000]),
-            "sgd_minibatch_size": lambda: np.random.choice([64, 128, 256, 512]),
-            "num_sgd_iter": lambda: np.random.choice([5, 10, 15, 20]),
+            #"sgd_minibatch_size": lambda: np.random.choice([64, 128, 256, 512]),
+            #"num_sgd_iter": lambda: np.random.choice([5, 10, 15, 20]),
             "gamma": lambda: np.random.uniform(0.95, 0.999),
             "lambda": lambda: np.random.uniform(0.9, 1.0),
             
@@ -635,7 +641,7 @@ def train_with_pbt():
     # Настройка отчетности
     reporter = CLIReporter(
         metric_columns=["episode_reward_mean", "training_iteration", "timesteps_total"],
-        parameter_columns=["lr", "entropy_coeff", "clip_param"]
+        parameter_columns=["lr"]#, "entropy_coeff", "clip_param"]
     )
     
     # Запуск обучения
@@ -650,7 +656,7 @@ def train_with_pbt():
         checkpoint_freq=10,
         keep_checkpoints_num=5,
         checkpoint_score_attr="episode_reward_mean",
-        local_dir="./ray_results"
+        storage_path="./ray_results"
     )
     
     # Получаем лучший результат
