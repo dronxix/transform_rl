@@ -43,77 +43,108 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
     """
     Улучшенная модель трансформера с дополнительными параметрами оптимизации
     """
-    
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
-        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
+
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name, custom_model_config=None, **kwargs):
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs)
         nn.Module.__init__(self)
-        
+
+        # Объединяем model_config с custom_model_config для обратной совместимости
+        custom_config = model_config.get("custom_model_config", {})
+        full_config = {**model_config, **custom_config}
+
         # === ОСНОВНЫЕ ПАРАМЕТРЫ ===
-        self.d_model = model_config.get("d_model", 256)
-        self.nhead = model_config.get("nhead", 8)
-        self.num_layers = model_config.get("num_layers", 6)
-        self.dim_feedforward = model_config.get("dim_feedforward", 1024)
-        self.dropout = model_config.get("dropout", 0.1)
-        self.max_seq_length = model_config.get("max_seq_length", 100)
-        
+        self.d_model = full_config.get("d_model", 256)
+        self.nhead = full_config.get("nhead", 8)
+        self.num_layers = full_config.get("num_layers", 6)
+        self.dim_feedforward = full_config.get("dim_feedforward", 1024)
+        self.dropout = full_config.get("dropout", 0.1)
+        self.max_seq_length = full_config.get("max_seq_length", 100)
+
         # === ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ ===
-        self.use_layer_norm = model_config.get("use_layer_norm", True)
-        self.pre_norm = model_config.get("pre_norm", True)
-        self.activation = model_config.get("activation", "gelu")
-        self.attention_dropout = model_config.get("attention_dropout", 0.1)
-        self.pos_encoding_type = model_config.get("pos_encoding_type", "learned")
-        self.aggregation_method = model_config.get("aggregation_method", "cls_attention")
-        self.num_cls_tokens = model_config.get("num_cls_tokens", 1)
-        self.hidden_sizes = model_config.get("hidden_sizes", [512, 256])
-        self.output_activation = model_config.get("output_activation", "tanh")
-        self.use_output_norm = model_config.get("use_output_norm", True)
-        self.init_std = model_config.get("init_std", 0.02)
-        
+        self.use_layer_norm = full_config.get("use_layer_norm", True)
+        self.pre_norm = full_config.get("pre_norm", True)
+        self.activation = full_config.get("activation", "gelu")
+        self.attention_dropout = full_config.get("attention_dropout", 0.1)
+        self.pos_encoding_type = full_config.get("pos_encoding_type", "learned")
+        self.aggregation_method = full_config.get("aggregation_method", "mean_pooling")  # Изменил на более стабильный
+        self.num_cls_tokens = full_config.get("num_cls_tokens", 1)
+        self.hidden_sizes = full_config.get("hidden_sizes", [256])  # Упростил архитектуру
+        self.output_activation = full_config.get("output_activation", "none")  # Убрал активацию на выходе
+        self.use_output_norm = full_config.get("use_output_norm", False)  # Отключил нормализацию на выходе
+        self.init_std = full_config.get("init_std", 0.01)  # Уменьшил std для инициализации
+
         self.input_dim = obs_space.shape[1]
         self.output_ranges = action_space.nvec if hasattr(action_space, 'nvec') else [action_space.n] * num_outputs
-        
+
+        # Сохраняем конфигурацию для отладки
+        self.model_config = full_config
+
         # === ВХОДНАЯ ПРОЕКЦИЯ ===
         self.input_projection = nn.Sequential(
             nn.Linear(self.input_dim, self.d_model),
             nn.LayerNorm(self.d_model) if self.use_layer_norm else nn.Identity(),
-            self._get_activation()
+            self._get_activation(),
+            nn.Dropout(self.dropout)
         )
-        
+
         # === ПОЗИЦИОННОЕ КОДИРОВАНИЕ ===
         if self.pos_encoding_type == "learned":
             self.pos_embedding = nn.Embedding(self.max_seq_length, self.d_model)
         elif self.pos_encoding_type == "sinusoidal":
             self.pos_encoding = PositionalEncoding(self.d_model, self.max_seq_length)
-        
-        # === УЛУЧШЕННЫЕ ТРАНСФОРМЕРНЫЕ СЛОИ ===
+
+        # === УПРОЩЕННЫЕ ТРАНСФОРМЕРНЫЕ СЛОИ ===
         encoder_layers = []
         for _ in range(self.num_layers):
-            layer = self._create_transformer_layer()
+            layer = nn.TransformerEncoderLayer(
+                d_model=self.d_model,
+                nhead=self.nhead,
+                dim_feedforward=self.dim_feedforward,
+                dropout=self.dropout,
+                activation=self.activation,
+                batch_first=True,
+                norm_first=self.pre_norm
+            )
             encoder_layers.append(layer)
         self.transformer_layers = nn.ModuleList(encoder_layers)
+
+        # === УПРОЩЕННЫЕ ВЫХОДНЫЕ СЛОИ ===
+        total_outputs = sum(self.output_ranges)
         
-        # === CLS ТОКЕНЫ ===
-        if self.aggregation_method == "cls_attention":
-            self.cls_tokens = nn.Parameter(torch.randn(1, self.num_cls_tokens, self.d_model))
-            self.cls_attention = nn.MultiheadAttention(
-                embed_dim=self.d_model,
-                num_heads=self.nhead,
-                dropout=self.attention_dropout,
-                batch_first=True
-            )
-        
-        # === УЛУЧШЕННЫЕ ВЫХОДНЫЕ СЛОИ ===
-        self.action_heads = nn.ModuleList([
-            self._create_output_head(action_range) for action_range in self.output_ranges
-        ])
-        
-        self.value_head = self._create_output_head(1, is_value=True)
-        
+        # Простая архитектура выходных слоев
+        self.action_head = nn.Sequential(
+            nn.Linear(self.d_model, self.hidden_sizes[0]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_sizes[0], total_outputs)
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Linear(self.d_model, self.hidden_sizes[0]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_sizes[0], 1)
+        )
+
         # Инициализация весов
         self._initialize_weights()
-        
+
         self._value_out = None
-    
+
+    def create_padding_mask(self, obs, seq_lengths):
+        """
+        Создает маску для паддинга последовательностей
+        """
+        batch_size, max_len = obs.shape[:2]
+        device = obs.device
+        
+        # Векторизованное создание маски
+        positions = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        seq_lengths = seq_lengths.unsqueeze(1).expand(-1, max_len)
+        mask = positions >= seq_lengths
+        
+        return mask
+
     def _get_activation(self):
         """Получение функции активации"""
         activations = {
@@ -122,130 +153,104 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
             "swish": nn.SiLU(),
             "tanh": nn.Tanh()
         }
-        return activations.get(self.activation, nn.GELU())
-    
-    def _create_transformer_layer(self):
-        """Создание улучшенного слоя трансформера"""
-        if self.pre_norm:
-            # Pre-LayerNorm архитектура (более стабильная)
-            return PreNormTransformerLayer(
-                d_model=self.d_model,
-                nhead=self.nhead,
-                dim_feedforward=self.dim_feedforward,
-                dropout=self.dropout,
-                attention_dropout=self.attention_dropout,
-                activation=self.activation
-            )
-        else:
-            # Стандартная архитектура
-            return nn.TransformerEncoderLayer(
-                d_model=self.d_model,
-                nhead=self.nhead,
-                dim_feedforward=self.dim_feedforward,
-                dropout=self.dropout,
-                activation=self.activation,
-                batch_first=True
-            )
-    
-    def _create_output_head(self, output_size, is_value=False):
-        """Создание улучшенной выходной головы"""
-        layers = []
-        
-        # Входной размер
-        current_size = self.d_model * self.num_cls_tokens if self.aggregation_method == "cls_attention" else self.d_model
-        
-        # Скрытые слои
-        for hidden_size in self.hidden_sizes:
-            layers.extend([
-                nn.Linear(current_size, hidden_size),
-                nn.LayerNorm(hidden_size) if self.use_output_norm else nn.Identity(),
-                self._get_activation(),
-                nn.Dropout(self.dropout)
-            ])
-            current_size = hidden_size
-        
-        # Выходной слой
-        layers.append(nn.Linear(current_size, output_size))
-        
-        # Активация на выходе (только для действий, не для value)
-        if not is_value and self.output_activation != "none":
-            if self.output_activation == "tanh":
-                layers.append(nn.Tanh())
-            elif self.output_activation == "sigmoid":
-                layers.append(nn.Sigmoid())
-        
-        return nn.Sequential(*layers)
-    
+        return activations.get(self.activation, nn.ReLU())
+
     def _initialize_weights(self):
-        """Инициализация весов модели"""
+        """Консервативная инициализация весов модели"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 if hasattr(module, 'weight') and module.weight is not None:
-                    torch.nn.init.normal_(module.weight, std=self.init_std)
+                    # Xavier uniform инициализация
+                    torch.nn.init.xavier_uniform_(module.weight, gain=1.0)
                 if hasattr(module, 'bias') and module.bias is not None:
-                    torch.nn.init.constant_(module.bias, 0)
+                    torch.nn.init.constant_(module.bias, 0.0)
             elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, std=self.init_std)
-    
+                torch.nn.init.normal_(module.weight, mean=0.0, std=self.init_std)
+            elif isinstance(module, nn.LayerNorm):
+                torch.nn.init.constant_(module.bias, 0.0)
+                torch.nn.init.constant_(module.weight, 1.0)
+
     def forward(self, input_dict, state, seq_lens):
-        """Улучшенный прямой проход"""
+        """Улучшенный прямой проход с проверками на NaN"""
         obs = input_dict["obs"]
         batch_size, max_len = obs.shape[:2]
-        
+
+        # Проверка входных данных на NaN/Inf
+        if torch.isnan(obs).any() or torch.isinf(obs).any():
+            print("Warning: NaN/Inf detected in input observations")
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # Получаем реальные длины последовательностей
-        seq_lengths = (obs.sum(dim=-1) != 0).sum(dim=1)
-        
+        # Более надежный способ определения длин
+        valid_mask = (obs.abs().sum(dim=-1) > 1e-6)  # Не нулевые наблюдения
+        seq_lengths = valid_mask.sum(dim=1)
+        seq_lengths = torch.clamp(seq_lengths, min=1)  # Минимум 1
+
         # Входная проекция
         x = self.input_projection(obs)
         
+        # Проверка после проекции
+        if torch.isnan(x).any():
+            print("Warning: NaN detected after input projection")
+            x = torch.nan_to_num(x, nan=0.0)
+
         # Позиционное кодирование
         if self.pos_encoding_type == "learned":
             positions = torch.arange(max_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+            positions = torch.clamp(positions, max=self.max_seq_length-1)
             pos_emb = self.pos_embedding(positions)
             x = x + pos_emb
         elif self.pos_encoding_type == "sinusoidal":
             x = self.pos_encoding(x)
-        
+
         # Маска для паддинга
         padding_mask = self.create_padding_mask(obs, seq_lengths)
-        
+
         # Пропускаем через трансформерные слои
-        for layer in self.transformer_layers:
-            if isinstance(layer, PreNormTransformerLayer):
-                x = layer(x, src_key_padding_mask=padding_mask)
-            else:
-                x = layer(x, src_key_padding_mask=padding_mask)
+        for i, layer in enumerate(self.transformer_layers):
+            x_prev = x
+            x = layer(x, src_key_padding_mask=padding_mask)
+            
+            # Проверка на NaN после каждого слоя
+            if torch.isnan(x).any():
+                print(f"Warning: NaN detected after transformer layer {i}")
+                x = x_prev  # Используем предыдущее значение
+                break
+
+        # Агрегация - используем простой mean pooling
+        # Создаем маску для валидных позиций
+        valid_mask_float = (~padding_mask).float().unsqueeze(-1)
         
-        # Агрегация
-        if self.aggregation_method == "cls_attention":
-            cls_tokens = self.cls_tokens.expand(batch_size, -1, -1)
-            aggregated, _ = self.cls_attention(
-                query=cls_tokens,
-                key=x,
-                value=x,
-                key_padding_mask=padding_mask
-            )
-            pooled = aggregated.view(batch_size, -1)  # Flatten CLS tokens
-        elif self.aggregation_method == "mean_pooling":
-            # Средневзвешенное по реальной длине
-            mask = (~padding_mask).float().unsqueeze(-1)
-            pooled = (x * mask).sum(dim=1) / mask.sum(dim=1)
-        elif self.aggregation_method == "max_pooling":
-            pooled = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf')).max(dim=1)[0]
+        # Избегаем деления на ноль
+        seq_lengths_safe = seq_lengths.clamp(min=1).float().unsqueeze(-1).unsqueeze(-1)
+        pooled = (x * valid_mask_float).sum(dim=1) / seq_lengths_safe.squeeze(-1)
         
+        # Финальная проверка на NaN в агрегированном представлении
+        if torch.isnan(pooled).any():
+            print("Warning: NaN detected in pooled representation")
+            pooled = torch.zeros_like(pooled)
+
         # Генерируем действия
-        actions = []
-        for head in self.action_heads:
-            action_logits = head(pooled)
-            actions.append(action_logits)
+        action_logits = self.action_head(pooled)
         
-        action_logits = torch.cat(actions, dim=-1)
-        
+        # Проверка и обработка NaN в выходных логитах
+        if torch.isnan(action_logits).any():
+            print("Warning: NaN detected in action logits, replacing with zeros")
+            action_logits = torch.zeros_like(action_logits)
+
         # Вычисляем значение состояния
-        self._value_out = self.value_head(pooled).squeeze(-1)
-        
+        value_out = self.value_head(pooled)
+        if torch.isnan(value_out).any():
+            print("Warning: NaN detected in value output, replacing with zeros")
+            value_out = torch.zeros_like(value_out)
+            
+        self._value_out = value_out.squeeze(-1)
+
         return action_logits, state
 
+    def value_function(self):
+        """Возвращает значение состояния"""
+        return self._value_out if self._value_out is not None else torch.zeros(1)
 
 class PreNormTransformerLayer(nn.Module):
     """Pre-LayerNorm трансформерный слой для лучшей стабильности обучения"""
@@ -472,24 +477,30 @@ def create_config():
     
     # Конфигурация PPO
     config = (PPOConfig()
-              .environment(env=CustomEnvironment, env_config=env_config)
-              .env_runners(num_env_runners=2, rollout_fragment_length=200)
-              .training(
-                  train_batch_size=2000,
-                  #sgd_minibatch_size=256,
-                  #num_sgd_iter=10,
-                  lr=3e-4,
-                  #entropy_coeff=0.01,
-                  #clip_param=0.2,
-                  #vf_loss_coeff=0.5,
-                  model=model_config
-              )
-              .api_stack(
-                  enable_rl_module_and_learner=False,
-                  enable_env_runner_and_connector_v2=False
-              )
-              .framework("torch")
-              .debugging(log_level="INFO"))
+                .environment(
+                    env=CustomEnvironment, 
+                    env_config=env_config)
+                .env_runners(
+                    num_env_runners=2, 
+                    rollout_fragment_length=200,
+                    num_gpus_per_env_runner=0.1
+                    )
+                .training(
+                    train_batch_size=2000,
+                    #sgd_minibatch_size=256,
+                    #num_sgd_iter=10,
+                    lr=3e-4,
+                    #entropy_coeff=0.01,
+                    #clip_param=0.2,
+                    #vf_loss_coeff=0.5,
+                    model=model_config
+                )
+                .api_stack(
+                    enable_rl_module_and_learner=False,
+                    enable_env_runner_and_connector_v2=False
+                )
+                .framework("torch")
+                .debugging(log_level="INFO"))
     
     return config, env_config
 
@@ -530,7 +541,7 @@ class StandaloneTransformer(nn.Module):
         self.num_outputs = model_state['num_outputs']
         
         # Создаем модель с теми же параметрами
-        self.model = TransformerModel(
+        self.model = ImprovedTransformerModel(
             obs_space=self.obs_space,
             action_space=self.action_space,
             num_outputs=self.num_outputs,
@@ -656,7 +667,7 @@ def train_with_pbt():
         checkpoint_freq=10,
         keep_checkpoints_num=5,
         checkpoint_score_attr="episode_reward_mean",
-        storage_path="./ray_results"
+        storage_path=r".\ray_pth"
     )
     
     # Получаем лучший результат
@@ -669,7 +680,7 @@ def train_with_pbt():
     trainer = PPO(config=base_config.to_dict())
     trainer.restore(best_checkpoint)
     
-    weights_path = save_model_weights(trainer, "./saved_models")
+    weights_path = save_model_weights(trainer, r".\saved_models")
     
     return weights_path, analysis
 
