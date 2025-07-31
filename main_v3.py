@@ -15,7 +15,7 @@ from gymnasium import spaces
 import pickle
 import os
 from typing import Dict, Any, List, Tuple, Optional
-
+os.environ["TUNE_DISABLE_STRICT_METRIC_CHECKING"] = "1"
 
 class PositionalEncoding(nn.Module):
     """Позиционное кодирование для трансформера"""
@@ -608,7 +608,7 @@ def train_with_pbt():
     # Настройка PBT с расширенным поиском гиперпараметров
     pbt = PopulationBasedTraining(
         time_attr="training_iteration",
-        metric="episode_reward_mean",
+        metric="env_runners/episode_reward_mean",
         mode="max",
         perturbation_interval=15,  # Увеличил интервал для стабильности
         resample_probability=0.25,  # Вероятность полной повторной выборки
@@ -651,7 +651,7 @@ def train_with_pbt():
     
     # Настройка отчетности
     reporter = CLIReporter(
-        metric_columns=["episode_reward_mean", "training_iteration", "timesteps_total"],
+        metric_columns=["env_runners/episode_reward_mean", "training_iteration", "timesteps_total"],
         parameter_columns=["lr"]#, "entropy_coeff", "clip_param"]
     )
     
@@ -666,13 +666,13 @@ def train_with_pbt():
         progress_reporter=reporter,
         checkpoint_freq=10,
         keep_checkpoints_num=5,
-        checkpoint_score_attr="episode_reward_mean",
+        checkpoint_score_attr="env_runners/episode_reward_mean",
         storage_path=r".\ray_pth"
     )
     
     # Получаем лучший результат
-    best_trial = analysis.get_best_trial("episode_reward_mean", "max")
-    best_checkpoint = analysis.get_best_checkpoint(best_trial, "episode_reward_mean", "max")
+    best_trial = analysis.get_best_trial("env_runners/episode_reward_mean", "max")
+    best_checkpoint = analysis.get_best_checkpoint(best_trial, "env_runners/episode_reward_mean", "max")
     
     print(f"Лучший чекпоинт: {best_checkpoint}")
     
