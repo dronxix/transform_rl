@@ -40,10 +40,6 @@ class PositionalEncoding(nn.Module):
 
 
 class ImprovedTransformerModel(TorchModelV2, nn.Module):
-    """
-    Улучшенная модель трансформера с дополнительными параметрами оптимизации
-    """
-
     def __init__(self, obs_space, action_space, num_outputs, model_config, name, custom_model_config=None, **kwargs):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs)
         nn.Module.__init__(self)
@@ -66,15 +62,24 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
         self.activation = full_config.get("activation", "gelu")
         self.attention_dropout = full_config.get("attention_dropout", 0.1)
         self.pos_encoding_type = full_config.get("pos_encoding_type", "learned")
-        self.aggregation_method = full_config.get("aggregation_method", "mean_pooling")  # Изменил на более стабильный
+        self.aggregation_method = full_config.get("aggregation_method", "mean_pooling")
         self.num_cls_tokens = full_config.get("num_cls_tokens", 1)
-        self.hidden_sizes = full_config.get("hidden_sizes", [256])  # Упростил архитектуру
-        self.output_activation = full_config.get("output_activation", "none")  # Убрал активацию на выходе
-        self.use_output_norm = full_config.get("use_output_norm", False)  # Отключил нормализацию на выходе
-        self.init_std = full_config.get("init_std", 0.01)  # Уменьшил std для инициализации
+        self.hidden_sizes = full_config.get("hidden_sizes", [256])
+        self.output_activation = full_config.get("output_activation", "none")
+        self.use_output_norm = full_config.get("use_output_norm", False)
+        self.init_std = full_config.get("init_std", 0.01)
 
         self.input_dim = obs_space.shape[1]
-        self.output_ranges = action_space.nvec if hasattr(action_space, 'nvec') else [action_space.n] * num_outputs
+        
+        # Поддержка spaces.Box для action_space
+        if isinstance(action_space, spaces.Box):
+            self.action_space_type = "box"
+            self.action_dim = action_space.shape[0]
+            self.action_low = torch.FloatTensor(action_space.low)
+            self.action_high = torch.FloatTensor(action_space.high)
+        else:
+            self.action_space_type = "discrete"
+            self.output_ranges = action_space.nvec if hasattr(action_space, 'nvec') else [action_space.n] * num_outputs
 
         # Сохраняем конфигурацию для отладки
         self.model_config = full_config
@@ -108,16 +113,32 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
             encoder_layers.append(layer)
         self.transformer_layers = nn.ModuleList(encoder_layers)
 
-        # === УПРОЩЕННЫЕ ВЫХОДНЫЕ СЛОИ ===
-        total_outputs = sum(self.output_ranges)
-        
-        # Простая архитектура выходных слоев
-        self.action_head = nn.Sequential(
-            nn.Linear(self.d_model, self.hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_sizes[0], total_outputs)
-        )
+        # === ВЫХОДНЫЕ СЛОИ В ЗАВИСИМОСТИ ОТ ТИПА ACTION SPACE ===
+        if self.action_space_type == "box":
+            # Для непрерывных действий: среднее и логарифм стандартного отклонения
+            self.action_mean_head = nn.Sequential(
+                nn.Linear(self.d_model, self.hidden_sizes[0]),
+                nn.ReLU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.hidden_sizes[0], self.action_dim)
+            )
+            
+            # Параметризуемое стандартное отклонение
+            self.action_log_std_head = nn.Sequential(
+                nn.Linear(self.d_model, self.hidden_sizes[0]),
+                nn.ReLU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.hidden_sizes[0], self.action_dim)
+            )
+        else:
+            # Для дискретных действий
+            total_outputs = sum(self.output_ranges)
+            self.action_head = nn.Sequential(
+                nn.Linear(self.d_model, self.hidden_sizes[0]),
+                nn.ReLU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.hidden_sizes[0], total_outputs)
+            )
 
         self.value_head = nn.Sequential(
             nn.Linear(self.d_model, self.hidden_sizes[0]),
@@ -171,7 +192,7 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
                 torch.nn.init.constant_(module.weight, 1.0)
 
     def forward(self, input_dict, state, seq_lens):
-        """Улучшенный прямой проход с проверками на NaN"""
+        """Улучшенный прямой проход с поддержкой Box action space"""
         obs = input_dict["obs"]
         batch_size, max_len = obs.shape[:2]
 
@@ -181,15 +202,13 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
             obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # Получаем реальные длины последовательностей
-        # Более надежный способ определения длин
-        valid_mask = (obs.abs().sum(dim=-1) > 1e-6)  # Не нулевые наблюдения
+        valid_mask = (obs.abs().sum(dim=-1) > 1e-6)
         seq_lengths = valid_mask.sum(dim=1)
-        seq_lengths = torch.clamp(seq_lengths, min=1)  # Минимум 1
+        seq_lengths = torch.clamp(seq_lengths, min=1)
 
         # Входная проекция
         x = self.input_projection(obs)
         
-        # Проверка после проекции
         if torch.isnan(x).any():
             print("Warning: NaN detected after input projection")
             x = torch.nan_to_num(x, nan=0.0)
@@ -211,29 +230,44 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
             x_prev = x
             x = layer(x, src_key_padding_mask=padding_mask)
             
-            # Проверка на NaN после каждого слоя
             if torch.isnan(x).any():
                 print(f"Warning: NaN detected after transformer layer {i}")
-                x = x_prev  # Используем предыдущее значение
+                x = x_prev
                 break
 
-        # Агрегация - используем простой mean pooling
-        # Создаем маску для валидных позиций
+        # Агрегация
         valid_mask_float = (~padding_mask).float().unsqueeze(-1)
-        
-        # Избегаем деления на ноль
         seq_lengths_safe = seq_lengths.clamp(min=1).float().unsqueeze(-1).unsqueeze(-1)
         pooled = (x * valid_mask_float).sum(dim=1) / seq_lengths_safe.squeeze(-1)
         
-        # Финальная проверка на NaN в агрегированном представлении
         if torch.isnan(pooled).any():
             print("Warning: NaN detected in pooled representation")
             pooled = torch.zeros_like(pooled)
 
-        # Генерируем действия
-        action_logits = self.action_head(pooled)
+        # Генерируем действия в зависимости от типа action space
+        if self.action_space_type == "box":
+            # Для непрерывных действий возвращаем конкатенированные mean и log_std
+            action_mean = self.action_mean_head(pooled)
+            action_log_std = self.action_log_std_head(pooled)
+            
+            # Ограничиваем значения для стабильности
+            action_mean = torch.tanh(action_mean)  # Нормализуем в [-1, 1]
+            action_log_std = torch.clamp(action_log_std, min=-5, max=0)  # Ограничиваем log_std
+            
+            # Масштабируем mean к диапазону действий
+            device = action_mean.device
+            action_low = self.action_low.to(device)
+            action_high = self.action_high.to(device)
+            
+            # Масштабируем от [-1, 1] к [low, high]
+            action_mean = action_low + (action_mean + 1.0) * 0.5 * (action_high - action_low)
+            
+            # Конкатенируем mean и log_std для возврата
+            action_logits = torch.cat([action_mean, action_log_std], dim=-1)
+        else:
+            # Для дискретных действий
+            action_logits = self.action_head(pooled)
         
-        # Проверка и обработка NaN в выходных логитах
         if torch.isnan(action_logits).any():
             print("Warning: NaN detected in action logits, replacing with zeros")
             action_logits = torch.zeros_like(action_logits)
@@ -252,48 +286,6 @@ class ImprovedTransformerModel(TorchModelV2, nn.Module):
         """Возвращает значение состояния"""
         return self._value_out if self._value_out is not None else torch.zeros(1)
 
-class PreNormTransformerLayer(nn.Module):
-    """Pre-LayerNorm трансформерный слой для лучшей стабильности обучения"""
-    
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, attention_dropout, activation):
-        super().__init__()
-        
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = nn.MultiheadAttention(
-            d_model, nhead, dropout=attention_dropout, batch_first=True
-        )
-        self.dropout1 = nn.Dropout(dropout)
-        
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            self._get_activation(activation),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout)
-        )
-    
-    def _get_activation(self, activation):
-        activations = {
-            "relu": nn.ReLU(),
-            "gelu": nn.GELU(),
-            "swish": nn.SiLU()
-        }
-        return activations.get(activation, nn.GELU())
-    
-    def forward(self, x, src_key_padding_mask=None):
-        # Pre-norm архитектура
-        norm_x = self.norm1(x)
-        attn_out, _ = self.attention(norm_x, norm_x, norm_x, key_padding_mask=src_key_padding_mask)
-        x = x + self.dropout1(attn_out)
-        
-        norm_x = self.norm2(x)
-        ffn_out = self.ffn(norm_x)
-        x = x + ffn_out
-        
-        return x
-
-
 class CustomEnvironment(gym.Env):
     """
     Кастомная среда для обучения
@@ -307,8 +299,9 @@ class CustomEnvironment(gym.Env):
         self.max_sequence_length = config.get("max_sequence_length", 50)
         self.min_sequence_length = config.get("min_sequence_length", 5)
         self.observation_dim = config.get("observation_dim", 10)
-        self.num_actions = config.get("num_actions", 3)
-        self.action_ranges = config.get("action_ranges", [5, 10, 3])  # Диапазоны для каждого действия
+        
+        # Поддержка как дискретных, так и непрерывных действий
+        self.action_type = config.get("action_type", "box")  # "box" или "discrete"
         
         # Определяем пространства
         self.observation_space = spaces.Box(
@@ -318,8 +311,21 @@ class CustomEnvironment(gym.Env):
             dtype=np.float32
         )
         
-        # Дискретное многомерное пространство действий
-        self.action_space = spaces.MultiDiscrete(self.action_ranges)
+        if self.action_type == "box":
+            # Непрерывное пространство действий
+            self.action_dim = config.get("action_dim", 3)
+            self.action_low = config.get("action_low", [-1.0] * self.action_dim)
+            self.action_high = config.get("action_high", [1.0] * self.action_dim)
+            
+            self.action_space = spaces.Box(
+                low=np.array(self.action_low, dtype=np.float32),
+                high=np.array(self.action_high, dtype=np.float32),
+                dtype=np.float32
+            )
+        else:
+            # Дискретное пространство действий (оригинальный код)
+            self.action_ranges = config.get("action_ranges", [5, 10, 3])
+            self.action_space = spaces.MultiDiscrete(self.action_ranges)
         
         # Состояние среды
         self.current_sequence = None
@@ -385,31 +391,42 @@ class CustomEnvironment(gym.Env):
         return self.current_sequence, reward, terminated, truncated, info
     
     def _calculate_reward(self, action):
-        """Псевдокод для вычисления награды"""
-        # Пример: награда зависит от того, насколько хорошо действие
-        # соответствует скрытому паттерну в данных
-        
+        """Улучшенная функция награды для поддержки Box actions"""
         base_reward = 1.0
         
-        # Штраф/бонус за каждое действие
-        action_rewards = []
-        for i, (act, max_val) in enumerate(zip(action, self.action_ranges)):
-            # Нормализуем действие к [0, 1]
-            normalized_action = act / (max_val - 1)
+        if self.action_type == "box":
+            # Для непрерывных действий
+            # Целевые значения основаны на статистике наблюдений
+            valid_obs = self.current_sequence[self.current_sequence.sum(axis=1) != 0]
+            if len(valid_obs) > 0:
+                mean_obs = np.mean(valid_obs, axis=0)
+                target_actions = np.tanh(mean_obs[:self.action_dim])  # Нормализуем к [-1, 1]
+                
+                # Масштабируем к диапазону действий
+                target_actions = (target_actions + 1.0) * 0.5  # К [0, 1]
+                target_actions = self.action_low + target_actions * (np.array(self.action_high) - np.array(self.action_low))
+                
+                # Награда обратно пропорциональна расстоянию
+                distances = np.abs(action - target_actions)
+                normalized_distances = distances / (np.array(self.action_high) - np.array(self.action_low))
+                action_reward = 1.0 - np.mean(normalized_distances)
+            else:
+                action_reward = 0.0
+        else:
+            # Оригинальная логика для дискретных действий
+            action_rewards = []
+            for i, (act, max_val) in enumerate(zip(action, self.action_ranges)):
+                normalized_action = act / (max_val - 1)
+                mean_obs = np.mean(self.current_sequence[self.current_sequence.sum(axis=1) != 0])
+                target_normalized = (mean_obs + 1) / 2
+                target_normalized = np.clip(target_normalized, 0, 1)
+                distance = abs(normalized_action - target_normalized)
+                action_reward = 1.0 - distance
+                action_rewards.append(action_reward)
             
-            # Целевое значение зависит от среднего значения текущей последовательности
-            mean_obs = np.mean(self.current_sequence[self.current_sequence.sum(axis=1) != 0])
-            target_normalized = (mean_obs + 1) / 2  # Нормализуем к [0, 1]
-            target_normalized = np.clip(target_normalized, 0, 1)
-            
-            # Награда обратно пропорциональна расстоянию до цели
-            distance = abs(normalized_action - target_normalized)
-            action_reward = 1.0 - distance
-            action_rewards.append(action_reward)
+            action_reward = np.mean(action_rewards)
         
-        total_reward = base_reward + np.mean(action_rewards)
-        
-        # Добавляем случайный шум для исследования
+        total_reward = base_reward + action_reward
         total_reward += np.random.normal(0, 0.1)
         
         return float(total_reward)
@@ -419,12 +436,22 @@ def create_config():
     """Создание конфигурации для PPO"""
     
     # Конфигурация среды
+    # env_config = {
+    #     "max_sequence_length": 50,
+    #     "min_sequence_length": 5,
+    #     "observation_dim": 10,
+    #     "num_actions": 3,
+    #     "action_ranges": [5, 10, 3],
+    #     "max_steps": 200
+    # }
     env_config = {
         "max_sequence_length": 50,
         "min_sequence_length": 5,
         "observation_dim": 10,
-        "num_actions": 3,
-        "action_ranges": [5, 10, 3],
+        "action_type": "box",
+        "action_dim": 3,
+        "action_low": [-2.0, -1.0, -3.0],
+        "action_high": [2.0, 1.0, 3.0],
         "max_steps": 200
     }
     
@@ -554,35 +581,56 @@ class StandaloneTransformer(nn.Module):
         self.model.eval()
     
     def predict(self, observation):
-        """Предсказание действий для данного наблюдения"""
+        """Предсказание действий для данного наблюдения с поддержкой Box actions"""
         with torch.no_grad():
-            # Подготавливаем входные данные
             if isinstance(observation, np.ndarray):
                 observation = torch.FloatTensor(observation)
             
             if len(observation.shape) == 2:
-                observation = observation.unsqueeze(0)  # Добавляем batch dimension
+                observation = observation.unsqueeze(0)
             
             input_dict = {"obs": observation}
             action_logits, _ = self.model(input_dict, [], None)
             
-            # Преобразуем логиты в действия
-            actions = []
-            start_idx = 0
-            
-            if hasattr(self.action_space, 'nvec'):
-                action_ranges = self.action_space.nvec
+            if self.model.action_space_type == "box":
+                # Для непрерывных действий
+                batch_size = action_logits.shape[0]
+                action_dim = self.model.action_dim
+                
+                # Разделяем на mean и log_std
+                action_mean = action_logits[:, :action_dim]
+                action_log_std = action_logits[:, action_dim:]
+                
+                # Сэмплируем действия из нормального распределения
+                action_std = torch.exp(action_log_std)
+                dist = torch.distributions.Normal(action_mean, action_std)
+                actions = dist.sample()
+                
+                # Ограничиваем действия к допустимому диапазону
+                device = actions.device
+                action_low = self.model.action_low.to(device)
+                action_high = self.model.action_high.to(device)
+                actions = torch.clamp(actions, action_low, action_high)
+                
+                return actions.squeeze(0).cpu().numpy()
             else:
-                action_ranges = [self.action_space.n] * self.num_outputs
-            
-            for action_range in action_ranges:
-                end_idx = start_idx + action_range
-                action_probs = F.softmax(action_logits[:, start_idx:end_idx], dim=-1)
-                action = torch.argmax(action_probs, dim=-1)
-                actions.append(action.item())
-                start_idx = end_idx
-            
-            return actions
+                # Оригинальная логика для дискретных действий
+                actions = []
+                start_idx = 0
+                
+                if hasattr(self.action_space, 'nvec'):
+                    action_ranges = self.action_space.nvec
+                else:
+                    action_ranges = [self.action_space.n] * self.num_outputs
+                
+                for action_range in action_ranges:
+                    end_idx = start_idx + action_range
+                    action_probs = F.softmax(action_logits[:, start_idx:end_idx], dim=-1)
+                    action = torch.argmax(action_probs, dim=-1)
+                    actions.append(action.item())
+                    start_idx = end_idx
+                
+                return actions
 
 
 def load_standalone_model(weights_path: str) -> StandaloneTransformer:
