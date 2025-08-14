@@ -161,34 +161,34 @@ def main():
     config = config.callbacks(create_callbacks)
 
     # ИЛИ альтернативный способ - через лямбду:
-    config = config.callbacks(lambda: LeagueCallbacks().setup(
-        league_actor=league,
-        opponent_ids=opponent_ids,
-        eval_episodes=4,
-        clone_every_iters=15,
-        curriculum_schedule=[(0, [1], [1]), (2_000_000, [1, 2], [1, 2])]
-    ))
+    # config = config.callbacks(lambda: LeagueCallbacks().setup(
+    #     league_actor=league,
+    #     opponent_ids=opponent_ids,
+    #     eval_episodes=4,
+    #     clone_every_iters=15,
+    #     curriculum_schedule=[(0, [1], [1]), (2_000_000, [1, 2], [1, 2])]
+    # ))
 
-    # ИЛИ самый простой способ - через класс:
-    class ConfiguredLeagueCallbacks(LeagueCallbacks):
-        def __init__(self):
-            super().__init__()
-            # Здесь сразу настраиваем параметры
-            self.league = None  # Будет установлено позже
-            self.opponent_ids = [f"opponent_{i}" for i in range(6)]
-            self.eval_eps = 4
-            self.clone_every = 15
-            self.curriculum = [
-                (0, [1], [1]),
-                (2_000_000, [1, 2], [1, 2]),
-                (8_000_000, [1, 2, 3], [1, 2, 3]),
-            ]
+    # # ИЛИ самый простой способ - через класс:
+    # class ConfiguredLeagueCallbacks(LeagueCallbacks):
+    #     def __init__(self):
+    #         super().__init__()
+    #         # Здесь сразу настраиваем параметры
+    #         self.league = None  # Будет установлено позже
+    #         self.opponent_ids = [f"opponent_{i}" for i in range(6)]
+    #         self.eval_eps = 4
+    #         self.clone_every = 15
+    #         self.curriculum = [
+    #             (0, [1], [1]),
+    #             (2_000_000, [1, 2], [1, 2]),
+    #             (8_000_000, [1, 2, 3], [1, 2, 3]),
+    #         ]
         
-        def set_league(self, league_actor):
-            self.league = league_actor
+    #     def set_league(self, league_actor):
+    #         self.league = league_actor
 
     # Используем класс напрямую
-    config = config.callbacks(ConfiguredLeagueCallbacks)
+    # config = config.callbacks(ConfiguredLeagueCallbacks)
     
     # Построение алгоритма
     algo = config.build()

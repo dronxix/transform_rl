@@ -63,7 +63,9 @@ class GSPOTorchPolicy(PPOTorchPolicy):
         # ИСПРАВЛЕНИЕ: Используем строковые ключи
         sample_batch["advantages"] = adv
         sample_batch["value_targets"] = vtarg
-        sample_batch["gspo_adv_mean"] = float(np.mean(adv))
+        # sample_batch["gspo_adv_mean"] = float(np.mean(adv))
+        mean_adv = np.mean(adv, dtype=np.float32)
+        sample_batch["gspo_adv_mean"] = np.full_like(adv, mean_adv, dtype=np.float32)
         
         return sample_batch
 
@@ -137,6 +139,8 @@ class GRPOTorchPolicy(PPOTorchPolicy):
         # ИСПРАВЛЕНИЕ: Используем строковые ключи
         sample_batch["advantages"] = adv
         sample_batch["value_targets"] = vtarg
-        sample_batch["grpo_rel_adv"] = float(rel_adv)
+        # sample_batch["grpo_rel_adv"] = float(rel_adv)
+        T = len(sample_batch["rewards"])
+        sample_batch["grpo_rel_adv"] = np.full((T,), np.float32(rel_adv), dtype=np.float32)
         
         return sample_batch

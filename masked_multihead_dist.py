@@ -1,16 +1,14 @@
 """
 Кастомный TorchDistributionWrapper - ИСПРАВЛЕН для Ray 2.48:
-- Добавлен required_model_output_shape
-- Исправлена проблема с last_sample  
-- Добавлен метод kl для KL divergence
-- ИСПРАВЛЕНИЕ: Возвращаем Dict вместо плоского array
+- Возвращает numpy arrays вместо тензоров для совместимости с Ray
+- Правильная обработка Dict действий
 """
 
+import numpy as np
 import torch
 from torch.distributions import Categorical, Normal, Bernoulli
 from ray.rllib.models.torch.torch_action_dist import TorchDistributionWrapper
 from ray.rllib.models import ModelCatalog
-import gymnasium as gym
 
 class MaskedTargetMoveAimFire(TorchDistributionWrapper):
     def __init__(self, inputs, model):
@@ -35,10 +33,10 @@ class MaskedTargetMoveAimFire(TorchDistributionWrapper):
         self.am  = Normal(mu_aim,  logstd_am.exp())
         self.fr  = Bernoulli(logits=logit_fr)
         
-        # ИСПРАВЛЕНИЕ: Инициализируем last_sample
+        # Инициализируем last_sample
         self.last_sample = None
         
-        # ИСПРАВЛЕНИЕ: Добавляем атрибут dist для совместимости
+        # Добавляем атрибут dist для совместимости
         self.dist = self.cat
 
     @staticmethod
@@ -76,59 +74,104 @@ class MaskedTargetMoveAimFire(TorchDistributionWrapper):
         
         return output_size
 
-    def _convert_to_dict(self, flat_action):
-        """Преобразует плоское действие в Dict формат"""
-        if isinstance(flat_action, dict):
-            return flat_action  # Уже в правильном формате
-            
-        # Извлекаем компоненты из плоского действия
-        target = flat_action[..., 0:1]  # [B, 1]
-        move = flat_action[..., 1:3]    # [B, 2] 
-        aim = flat_action[..., 3:5]     # [B, 2]
-        fire = flat_action[..., 5:6]    # [B, 1]
+    def _convert_to_numpy_dict(self, tensor_action):
+        """Преобразует тензор действия в Dict с numpy arrays"""
+        # Убеждаемся что работаем с CPU tensor
+        if tensor_action.is_cuda:
+            tensor_action = tensor_action.cpu()
         
-        return {
-            "target": target.squeeze(-1).long(),  # [B] - дискретное
-            "move": move,                         # [B, 2] - непрерывное
-            "aim": aim,                          # [B, 2] - непрерывное  
-            "fire": fire.squeeze(-1).long(),     # [B] - дискретное
+        # Если батч размерности нет, добавляем
+        if tensor_action.dim() == 1:
+            tensor_action = tensor_action.unsqueeze(0)
+            squeeze_batch = True
+        else:
+            squeeze_batch = False
+        
+        # Извлекаем компоненты
+        target = tensor_action[..., 0].long()
+        move = tensor_action[..., 1:3]
+        aim = tensor_action[..., 3:5]
+        fire = tensor_action[..., 5].long()
+        
+        # Конвертируем в numpy
+        result = {
+            "target": target.numpy(),
+            "move": move.numpy(),
+            "aim": aim.numpy(),
+            "fire": fire.numpy(),
         }
+        
+        # Если был single sample, убираем батч размерность
+        if squeeze_batch:
+            result = {k: v[0] for k, v in result.items()}
+        
+        return result
 
     def sample(self):
+        """Возвращает сэмпл в формате Dict с numpy arrays"""
         t = self.cat.sample().unsqueeze(-1).float()
         mv = torch.tanh(self.mv.rsample())
         am = torch.tanh(self.am.rsample())
         fr = self.fr.sample().float()
+        
+        # Объединяем в плоский тензор
         flat_action = torch.cat([t, mv, am, fr], dim=-1)
         
-        # ИСПРАВЛЕНИЕ: Сохраняем плоское действие для логирования
+        # Сохраняем для логирования
         self.last_sample = flat_action
         
-        # ИСПРАВЛЕНИЕ: Возвращаем Dict формат
-        return self._convert_to_dict(flat_action)
+        # Конвертируем в numpy dict
+        return self._convert_to_numpy_dict(flat_action)
 
     def deterministic_sample(self):
+        """Возвращает детерминированный сэмпл в формате Dict с numpy arrays"""
         t = torch.argmax(self.cat.logits, dim=-1).unsqueeze(-1).float()
         mv = torch.tanh(self.mv.loc)
         am = torch.tanh(self.am.loc)
         fr = (self.fr.logits > 0).float()
+        
+        # Объединяем в плоский тензор
         flat_action = torch.cat([t, mv, am, fr], dim=-1)
         
-        # ИСПРАВЛЕНИЕ: Сохраняем плоское действие для логирования
+        # Сохраняем для логирования
         self.last_sample = flat_action
         
-        # ИСПРАВЛЕНИЕ: Возвращаем Dict формат
-        return self._convert_to_dict(flat_action)
+        # Конвертируем в numpy dict
+        return self._convert_to_numpy_dict(flat_action)
 
     def logp(self, x):
-        """x может быть как Dict, так и плоским тензором"""
+        """x может быть как Dict с numpy/tensor, так и плоским тензором"""
+        # Преобразуем в тензор если нужно
         if isinstance(x, dict):
-            # Преобразуем Dict обратно в плоский формат для вычисления logp
-            target = x["target"].float().unsqueeze(-1)  # [B, 1]
-            move = x["move"]                            # [B, 2]
-            aim = x["aim"]                             # [B, 2] 
-            fire = x["fire"].float().unsqueeze(-1)     # [B, 1]
+            # Конвертируем numpy в tensor если нужно
+            target = x["target"]
+            move = x["move"]
+            aim = x["aim"]
+            fire = x["fire"]
+            
+            # Конвертируем в тензоры
+            if isinstance(target, np.ndarray):
+                target = torch.from_numpy(target).float()
+            if isinstance(move, np.ndarray):
+                move = torch.from_numpy(move).float()
+            if isinstance(aim, np.ndarray):
+                aim = torch.from_numpy(aim).float()
+            if isinstance(fire, np.ndarray):
+                fire = torch.from_numpy(fire).float()
+            
+            # Убеждаемся что размерности правильные
+            if target.dim() == 1:
+                target = target.unsqueeze(-1)
+            if fire.dim() == 1:
+                fire = fire.unsqueeze(-1)
+                
             x = torch.cat([target, move, aim, fire], dim=-1)
+        elif isinstance(x, np.ndarray):
+            x = torch.from_numpy(x).float()
+        
+        # Убеждаемся что x - тензор на правильном устройстве
+        if x.device != self.cat.logits.device:
+            x = x.to(self.cat.logits.device)
         
         eps = 1e-6
         t_idx = x[..., 0].long()
@@ -145,21 +188,18 @@ class MaskedTargetMoveAimFire(TorchDistributionWrapper):
         lp_am = self.am.log_prob(z_am).sum(-1) - torch.log(1 - am.pow(2) + eps).sum(-1)
         p = torch.sigmoid(self.fr.logits.squeeze(-1))
         lp_fr = torch.where(fr > 0.5, torch.log(p + eps), torch.log(1 - p + eps))
+        
         return lp_t + lp_mv + lp_am + lp_fr
 
     def sampled_action_logp(self):
-        """
-        ИСПРАВЛЕНИЕ: Переопределяем метод для корректной работы с last_sample
-        """
+        """Переопределяем метод для корректной работы с last_sample"""
         if self.last_sample is None:
             # Если sample() еще не вызывался, делаем это
             self.sample()
         return self.logp(self.last_sample)
 
     def kl(self, other):
-        """
-        ИСПРАВЛЕНИЕ: Реализуем KL divergence для кастомной дистрибуции
-        """
+        """Реализуем KL divergence для кастомной дистрибуции"""
         if not isinstance(other, MaskedTargetMoveAimFire):
             # Если другая дистрибуция не того же типа, возвращаем 0
             return torch.zeros_like(self.cat.logits[..., 0])
