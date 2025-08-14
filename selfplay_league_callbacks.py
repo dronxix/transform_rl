@@ -18,7 +18,7 @@ from ray.rllib.callbacks.callbacks import RLlibCallback
 from ray.rllib.env.single_agent_episode import SingleAgentEpisode
 from ray.rllib.env.multi_agent_episode import MultiAgentEpisode
 from ray.rllib.evaluation.episode_v2 import EpisodeV2  # для совместимости со старым API
-from ray.rllib.env import EnvRunner
+from ray.rllib.env.env_runner import EnvRunner
 from ray.rllib.env.base_env import BaseEnv
 from ray.rllib.policy import Policy
 from ray.rllib.core.rl_module import RLModule
