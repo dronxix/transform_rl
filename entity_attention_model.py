@@ -1,9 +1,6 @@
 """
-EntityAttentionModel — трансформер с:
-- паддинг-масками (ally/enemy mask),
-- отдельные головы действий (target/move/aim/fire),
-- централизованная value по global_state,
-- сохранение карты внимания (last_attn) для TensorBoard.
+EntityAttentionModel — исправление для OrderedDict observation
+Ray сохранил Dict структуру, просто обернул в OrderedDict
 """
 
 import numpy as np
@@ -58,7 +55,7 @@ class AttnBlock(nn.Module):
         return x
 
 class EntityAttentionModel(TorchModelV2, nn.Module):
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
         nn.Module.__init__(self)
 
@@ -71,14 +68,32 @@ class EntityAttentionModel(TorchModelV2, nn.Module):
         self.logstd_min = float(cfg.get("logstd_min", -5.0))
         self.logstd_max = float(cfg.get("logstd_max", 2.0))
 
-        self_feats   = obs_space["self"].shape[0]
-        allies_shape = obs_space["allies"].shape
-        enemies_shape= obs_space["enemies"].shape
-        self.max_allies  = int(allies_shape[0])
-        self.max_enemies = int(enemies_shape[0])
-        ally_feats  = int(allies_shape[1])
-        enemy_feats = int(enemies_shape[1])
-        global_feats= int(obs_space["global_state"].shape[0])
+        # ИСПРАВЛЕНИЕ: Проверяем какой тип obs_space мы получили
+        print(f"DEBUG: obs_space type = {type(obs_space)}")
+        
+        if hasattr(obs_space, 'spaces'):
+            # Dict space - можем извлечь размеры напрямую
+            print("DEBUG: Dict observation space detected")
+            self_feats = obs_space["self"].shape[0]
+            allies_shape = obs_space["allies"].shape
+            enemies_shape = obs_space["enemies"].shape
+            self.max_allies = allies_shape[0]
+            self.max_enemies = enemies_shape[0]
+            ally_feats = allies_shape[1]
+            enemy_feats = enemies_shape[1]
+            global_feats = obs_space["global_state"].shape[0]
+        else:
+            # Box space или другой - используем значения по умолчанию
+            print("DEBUG: Non-Dict observation space, using defaults")
+            self.max_allies = int(cfg.get("max_allies", 6))
+            self.max_enemies = int(cfg.get("max_enemies", 6))
+            self_feats = 12
+            ally_feats = 8
+            enemy_feats = 10
+            global_feats = 64
+
+        print(f"DEBUG: max_allies={self.max_allies}, max_enemies={self.max_enemies}")
+        print(f"DEBUG: self_feats={self_feats}, ally_feats={ally_feats}, enemy_feats={enemy_feats}")
 
         # Энкодеры
         self.self_enc  = MLP([self_feats, d_model])
@@ -88,10 +103,10 @@ class EntityAttentionModel(TorchModelV2, nn.Module):
         self.posenc = PositionalEncoding(d_model, max_len=max(self.max_allies + self.max_enemies + 1, 64))
         self.blocks = nn.ModuleList([AttnBlock(d_model, nhead, ff) for _ in range(layers)])
         self.norm = nn.LayerNorm(d_model)
-        self.last_attn = None  # [B,H,L,L] — снимок последнего блока
+        self.last_attn = None
 
         # Политические головы
-        self.head_target     = MLP([d_model, hidden, self.max_enemies])  # logits по врагам
+        self.head_target     = MLP([d_model, hidden, self.max_enemies])
         self.head_move_mu    = MLP([d_model, hidden, 2])
         self.head_aim_mu     = MLP([d_model, hidden, 2])
         self.log_std_move    = nn.Parameter(torch.full((2,), -0.5))
@@ -102,15 +117,27 @@ class EntityAttentionModel(TorchModelV2, nn.Module):
         self.value_net = MLP([global_feats, hidden, 1])
 
         self._value_out: Optional[torch.Tensor] = None
-        self.obs_space_struct = {
-            "self": obs_space["self"],
-            "allies": obs_space["allies"],
-            "enemies": obs_space["enemies"],
-            "global_state": obs_space["global_state"]
-        }
 
     def forward(self, input_dict, state, seq_lens):
-        obs = input_dict["obs"]
+        # ИСПРАВЛЕНИЕ: Обрабатываем разные типы входных данных
+        raw_obs = input_dict["obs"]
+        print(f"DEBUG forward: type(raw_obs) = {type(raw_obs)}")
+        
+        if isinstance(raw_obs, dict):
+            # Уже Dict - используем напрямую
+            obs = raw_obs
+            print("DEBUG: Using dict obs directly")
+        else:
+            # Попытка восстановить из других форматов
+            print(f"DEBUG: raw_obs keys: {list(raw_obs.keys()) if hasattr(raw_obs, 'keys') else 'no keys'}")
+            obs = dict(raw_obs)  # Преобразуем OrderedDict в обычный dict
+            print("DEBUG: Converted OrderedDict to dict")
+        
+        # Логируем размеры для отладки
+        for key, value in obs.items():
+            if hasattr(value, 'shape'):
+                print(f"DEBUG: obs['{key}'].shape = {value.shape}")
+        
         # Токены: [self | allies... | enemies...]
         self_tok   = self.self_enc(obs["self"])                # [B,d]
         allies_tok = self.ally_enc(obs["allies"])              # [B,Na,d]
@@ -127,7 +154,7 @@ class EntityAttentionModel(TorchModelV2, nn.Module):
         x = self.posenc(x)
         for blk in self.blocks:
             x = blk(x, key_padding_mask=pad_mask)
-        self.last_attn = self.blocks[-1].last_attn  # [B,H,L,L]
+        self.last_attn = self.blocks[-1].last_attn
         x = self.norm(x)
 
         # Self-токен как «агрегат»
@@ -146,7 +173,7 @@ class EntityAttentionModel(TorchModelV2, nn.Module):
         log_std_aim  = self.log_std_aim .clamp(self.logstd_min, self.logstd_max).expand_as(mu_aim)
         logit_fire   = self.head_fire_logit(h)
 
-        # Склейка в один тензор (ожидает кастомный action_dist)
+        # Склейка в один тензор
         out = torch.cat([masked_logits, mu_move, log_std_move, mu_aim, log_std_aim, logit_fire], dim=-1)
 
         # Централизованная V

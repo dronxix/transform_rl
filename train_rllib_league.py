@@ -15,19 +15,14 @@ from masked_multihead_dist import MaskedTargetMoveAimFire
 from league_state import LeagueState
 from selfplay_league_callbacks import LeagueCallbacks
 from gspo_grpo_policy import GSPOTorchPolicy, GRPOTorchPolicy
+import torch
 
 def env_creator(cfg): 
     return ArenaEnv(cfg)
 
 def main():
-    # Ray 2.48 - инициализация
-    ray.init(
-        ignore_reinit_error=True,
-        num_cpus=None,
-        num_gpus=None,
-        include_dashboard=True,
-        dashboard_host="0.0.0.0"
-    )
+    # Инициализация Ray 2.48
+    ray.init(ignore_reinit_error=True)
 
     register_env("ArenaEnv", env_creator)
     ModelCatalog.register_custom_model("entity_attention", EntityAttentionModel)
@@ -36,132 +31,55 @@ def main():
     opponent_ids = [f"opponent_{i}" for i in range(6)]
     league = LeagueState.remote(opponent_ids)
 
+    # Статическая policy_mapping_fn для стабильности
+    def policy_mapping_fn(agent_id: str, episode=None, **kwargs):
+        if agent_id.startswith("red_"):
+            return "main"
+        else:
+            # Простая ротация оппонентов
+            import hashlib
+            hash_val = int(hashlib.md5(str(episode).encode()).hexdigest()[:8], 16)
+            return opponent_ids[hash_val % len(opponent_ids)]
+
+    # Получаем spaces
+    tmp_env = ArenaEnv({"ally_choices": [1], "enemy_choices": [1]})
+    obs_space = tmp_env.observation_space
+    act_space = tmp_env.action_space
+
+    # ВАЖНО: Извлекаем max_enemies из observation_space
+    max_enemies = obs_space["enemies"].shape[0]
+    max_allies = obs_space["allies"].shape[0]
+
+    # Базовая конфигурация модели
+    base_model_config = {
+        "custom_model": "entity_attention",
+        "custom_action_dist": "masked_multihead",
+        "custom_model_config": {
+            "d_model": 128,
+            "nhead": 8,
+            "layers": 2,
+            "ff": 256,
+            "hidden": 256,
+            "max_enemies": max_enemies,  # ПЕРЕДАЕМ ДЛЯ ACTION_DIST
+            "max_allies": max_allies,
+        },
+        "vf_share_layers": False,
+    }
+
     # Выбор алгоритма
     algo_variant = os.environ.get("ALGO_VARIANT", "gspo").lower()
     if algo_variant == "gspo": 
         policy_cls = GSPOTorchPolicy
-        vf_coeff = 1.0
-        ent_coeff = 0.003
     elif algo_variant == "grpo": 
         policy_cls = GRPOTorchPolicy
-        vf_coeff = 0.5
-        ent_coeff = 0.004
     else:
-        policy_cls = None
-        vf_coeff = 1.0
-        ent_coeff = 0.003
+        policy_cls = None  # стандартный PPO
 
-    def policy_mapping_fn(agent_id: str, episode, worker, **kwargs):
-        if agent_id.startswith("red_"):
-            return "main"
-        
-        # Получаем opp_id из episode
-        opp = None
-        # Проверяем разные типы episode для совместимости
-        if hasattr(episode, 'custom_data'):
-            opp = episode.custom_data.get("opp_id")
-        elif hasattr(episode, 'user_data'):
-            opp = episode.user_data.get("opp_id")
-            
-        if opp is None:
-            opp = ray.get(league.get_opponent_weighted.remote(3))
-            # Сохраняем для будущего использования
-            if hasattr(episode, 'custom_data'):
-                episode.custom_data["opp_id"] = opp
-            elif hasattr(episode, 'user_data'):
-                episode.user_data["opp_id"] = opp
-        return opp
-
-    # Получим spaces
-    tmp_env = ArenaEnv({
-        "ally_choices": [1, 2], 
-        "enemy_choices": [1, 2], 
-        "episode_len": 128
-    })
-    obs_space = tmp_env.observation_space
-    act_space = tmp_env.action_space
-
-    # Конфигурация политик
-    main_policy_config = {
-        "model": {
-            "custom_model": "entity_attention",
-            "custom_action_dist": "masked_multihead",
-            "custom_model_config": {
-                "d_model": 160,
-                "nhead": 8,
-                "layers": 2,
-                "ff": 320,
-                "hidden": 256,
-                "logstd_min": -5.0,
-                "logstd_max": 2.0,
-            },
-        },
-    }
-    
-    # Специфичные параметры для кастомных политик
-    if policy_cls:
-        main_policy_config["vf_loss_coeff"] = vf_coeff
-        if algo_variant == "grpo":
-            main_policy_config["grpo_ema_beta"] = 0.99
-
-    policies = {
-        "main": (
-            policy_cls,
-            obs_space,
-            act_space,
-            main_policy_config
-        )
-    }
-
-    # Оппоненты
-    for pid in opponent_ids:
-        policies[pid] = (
-            None,  # стандартный PPO
-            obs_space,
-            act_space,
-            {
-                "model": {
-                    "custom_model": "entity_attention",
-                    "custom_action_dist": "masked_multihead",
-                    "custom_model_config": {
-                        "d_model": 160,
-                        "nhead": 8,
-                        "layers": 2,
-                        "ff": 320,
-                        "hidden": 256,
-                        "logstd_min": -5.0,
-                        "logstd_max": 2.0,
-                    },
-                },
-            },
-        )
-
-    # Куррикулум
-    curriculum = [
-        (0,           [1],         [1]),
-        (2_000_000,   [1, 2],      [1, 2]),
-        (10_000_000,  [1, 2, 3],   [1, 2, 3]),
-        (25_000_000,  [1, 2, 3, 4],[1, 2, 3, 4]),
-    ]
-
-    # Создаем и настраиваем колбеки
-    callbacks = LeagueCallbacks()
-    callbacks.setup(
-        league_actor=league,
-        opponent_ids=opponent_ids,
-        eval_episodes=6,
-        clone_every_iters=10,
-        sample_top_k=3,
-        attn_log_every=20,
-        curriculum_schedule=curriculum,
-    )
-
-    # Ray 2.48 - ПРАВИЛЬНАЯ конфигурация
+    # RAY 2.48 КОНФИГУРАЦИЯ
     config = (
         PPOConfig()
+        # НЕ ВКЛЮЧАЕМ новый API stack - ModelV2 несовместим с RLModule
         .api_stack(
-            # ВАЖНО: используем старый API stack для ModelV2
-            # Новый stack требует RLModule вместо ModelV2
             enable_rl_module_and_learner=False,
             enable_env_runner_and_connector_v2=False,
         )
@@ -177,130 +95,136 @@ def main():
             }
         )
         .framework("torch")
-        # Ray 2.48 - env_runners используется только с новым API stack
-        # Для старого stack используем rollouts
-        .rollouts(
-            num_rollout_workers=8,
-            num_envs_per_worker=1,
-            rollout_fragment_length=256,
-            batch_mode="truncate_episodes",
-        )
-        .training(
-            gamma=0.99,
-            lr=3e-4,
-            train_batch_size=262144,  # 256k
-            sgd_minibatch_size=16384,
-            num_sgd_iter=4,
-            use_gae=True,
-            lambda_=0.95,
-            clip_param=0.15,
-            vf_clip_param=10.0,
-            entropy_coeff=ent_coeff,
-            model={
-                "vf_share_layers": False,
-            },
-        )
-        .multi_agent(
-            policies=policies,
-            policy_mapping_fn=policy_mapping_fn,
-            policies_to_train=["main"],
-            count_steps_by="agent_steps",
-        )
-        .callbacks(callbacks)
-        .resources(
-            num_gpus=1,
-            num_cpus_per_worker=1,
-            num_gpus_per_worker=0,
-        )
-        .debugging(
-            log_level="INFO",
-            seed=42,
-        )
-        .fault_tolerance(
-            recreate_failed_workers=True,
-            restart_failed_sub_environments=True,
-            num_consecutive_worker_failures_tolerance=3,
-        )
-    )
-
-    # Альтернативный вариант с НОВЫМ API stack (требует переписывания под RLModule)
-    use_new_stack = os.environ.get("USE_NEW_STACK", "false").lower() == "true"
-    
-    if use_new_stack:
-        print("WARNING: New API stack requires RLModule instead of ModelV2")
-        print("This will require rewriting entity_attention_model.py")
-        config = config.api_stack(
-            enable_rl_module_and_learner=True,
-            enable_env_runner_and_connector_v2=True,
-        )
-        # Для нового stack нужно использовать env_runners вместо rollouts
-        config = config.env_runners(
-            num_env_runners=8,
+        # RAY 2.48: используем env_runners вместо rollouts
+        .env_runners(
+            num_env_runners=4,
             num_envs_per_env_runner=1,
             rollout_fragment_length=256,
             batch_mode="truncate_episodes",
         )
+        .resources(
+            num_gpus=1 if torch.cuda.is_available() else 0,
+            num_cpus_for_main_process=1,  # RAY 2.48: изменился параметр
+        )
+        .training(
+            gamma=0.99,
+            lr=3e-4,
+            train_batch_size=16384,
+            minibatch_size=2048,
+            num_epochs=4,
+            use_gae=True,
+            lambda_=0.95,
+            clip_param=0.15,
+            vf_clip_param=10.0,
+            entropy_coeff=0.003,
+        )
+        .multi_agent(
+            policies = {
+                "main": (policy_cls, obs_space, act_space, {
+                    "model": base_model_config.copy()
+                }),
+                **{
+                    pid: (None, obs_space, act_space, {
+                        "model": base_model_config.copy()
+                    }) for pid in opponent_ids
+                }
+            },
+            policy_mapping_fn=policy_mapping_fn,
+            policies_to_train=["main"],
+            count_steps_by="agent_steps",
+        )
+        .debugging(
+            log_level="INFO",
+        )
+        .fault_tolerance(
+            restart_failed_env_runners=True,  # RAY 2.48: новый параметр
+        )
+    )
 
-    algo = config.build()
+    def create_callbacks():
+        """Фабрика для создания callbacks с правильными параметрами"""
+        callbacks = LeagueCallbacks()
+        callbacks.setup(
+            league_actor=league,
+            opponent_ids=opponent_ids,
+            eval_episodes=4,
+            clone_every_iters=15,
+            curriculum_schedule=[
+                (0, [1], [1]),
+                (2_000_000, [1, 2], [1, 2]),
+                (8_000_000, [1, 2, 3], [1, 2, 3]),
+            ]
+        )
+        return callbacks
 
-    # Инициализируем оппонентов
-    w = algo.get_policy("main").get_weights()
-    for pid in opponent_ids:
-        algo.get_policy(pid).set_weights(w)
+    # Передаем функцию, а не объект
+    config = config.callbacks(create_callbacks)
 
-    results_dir = os.path.abspath("./rllib_league_results")
-    os.makedirs(results_dir, exist_ok=True)
+    # ИЛИ альтернативный способ - через лямбду:
+    config = config.callbacks(lambda: LeagueCallbacks().setup(
+        league_actor=league,
+        opponent_ids=opponent_ids,
+        eval_episodes=4,
+        clone_every_iters=15,
+        curriculum_schedule=[(0, [1], [1]), (2_000_000, [1, 2], [1, 2])]
+    ))
 
-    # Обучение
-    next_ckpt = 5_000_000
-    max_iterations = int(os.environ.get("MAX_ITERATIONS", "2000"))
+    # ИЛИ самый простой способ - через класс:
+    class ConfiguredLeagueCallbacks(LeagueCallbacks):
+        def __init__(self):
+            super().__init__()
+            # Здесь сразу настраиваем параметры
+            self.league = None  # Будет установлено позже
+            self.opponent_ids = [f"opponent_{i}" for i in range(6)]
+            self.eval_eps = 4
+            self.clone_every = 15
+            self.curriculum = [
+                (0, [1], [1]),
+                (2_000_000, [1, 2], [1, 2]),
+                (8_000_000, [1, 2, 3], [1, 2, 3]),
+            ]
+        
+        def set_league(self, league_actor):
+            self.league = league_actor
+
+    # Используем класс напрямую
+    config = config.callbacks(ConfiguredLeagueCallbacks)
     
-    for i in range(max_iterations):
-        try:
-            res = algo.train()
+    # Построение алгоритма
+    algo = config.build()
+    
+    # Инициализация весов оппонентов
+    main_weights = algo.get_policy("main").get_weights()
+    for pid in opponent_ids:
+        algo.get_policy(pid).set_weights(main_weights)
+    
+    # Основной цикл тренировки
+    try:
+        for i in range(2000):
+            result = algo.train()
             
-            # Логирование - проверяем разные места для метрик
             if i % 10 == 0:
-                # Ray 2.48 - метрики могут быть в разных местах
-                rew_mean = res.get('episode_reward_mean', 0)
-                if rew_mean == 0:
-                    rew_mean = res.get('env_runners', {}).get('episode_reward_mean', 0)
-                if rew_mean == 0:
-                    rew_mean = res.get('sampler_results', {}).get('episode_reward_mean', 0)
+                # Ray 2.48 - метрики в env_runners
+                episode_reward_mean = result.get("env_runners", {}).get("episode_reward_mean", 0)
+                timesteps_total = result.get("timesteps_total", 0)
                 
-                ts_mu = res.get('custom_metrics', {}).get('ts_main_mu', 0)
-                steps = res.get('timesteps_total', 0)
-                
-                print(f"[{i}] rew_mean={rew_mean:.3f} "
-                      f"ts_mu={ts_mu:.2f} "
-                      f"steps={steps}")
+                print(f"[{i:4d}] reward: {episode_reward_mean:.3f}, "
+                      f"timesteps: {timesteps_total}")
                 
                 # Сохранение чекпоинта
-                checkpoint = algo.save(checkpoint_dir=results_dir)
-                print(f"Checkpoint saved: {checkpoint}")
-            
-            # Milestone checkpoints
-            if res.get("timesteps_total", 0) >= next_ckpt:
-                checkpoint = algo.save(checkpoint_dir=results_dir)
-                print(f"Milestone checkpoint at {next_ckpt}: {checkpoint}")
-                next_ckpt += 5_000_000
-                
-        except Exception as e:
-            print(f"Error during training iteration {i}: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Попытка восстановления
-            if 'checkpoint' in locals():
-                try:
-                    algo.restore(checkpoint)
-                    print("Restored from last checkpoint")
-                except:
-                    print("Could not restore, continuing...")
-            continue
-
-    algo.stop()
-    ray.shutdown()
+                checkpoint = algo.save()
+                if i % 50 == 0:
+                    print(f"Checkpoint saved: {checkpoint}")
+                    
+    except KeyboardInterrupt:
+        print("Training interrupted by user")
+    except Exception as e:
+        print(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        algo.stop()
+        ray.shutdown()
 
 if __name__ == "__main__":
     main()
