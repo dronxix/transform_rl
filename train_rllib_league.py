@@ -133,9 +133,9 @@ def main():
             policies_to_train=["main"],
             count_steps_by="agent_steps",
         )
-        .debugging(
-            log_level="INFO",
-        )
+        # .debugging(
+            # log_level="INFO",
+        # )
         .fault_tolerance(
             restart_failed_env_runners=True,  # RAY 2.48: новый параметр
         )

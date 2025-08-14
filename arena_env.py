@@ -136,6 +136,8 @@ class ArenaEnv(MultiAgentEnv):
             infos[aid] = {"battle_type": battle_type}
         return obs, infos
 
+    # В arena_env.py добавь эти исправления:
+
     def step(self, action_dict: Dict[str, Dict[str, Any]]):
         # 1) Применяем действия (с валидацией)
         for aid, act in action_dict.items():
@@ -192,33 +194,43 @@ class ArenaEnv(MultiAgentEnv):
         blue_hp = sum(max(0.0, self._hp[a]) for a in self._agents_blue)
         red_score, blue_score = red_hp - blue_hp, blue_hp - red_hp
 
+        # ИСПРАВЛЕНИЕ: Собираем obs только для живых агентов
+        alive_agents = []
         for aid in self._agents_red + self._agents_blue:
-            if self._is_alive(aid): obs[aid] = self._build_obs(aid)
-            rews[aid] = 0.0
+            if self._is_alive(aid): 
+                obs[aid] = self._build_obs(aid)
+                alive_agents.append(aid)
+                rews[aid] = 0.0
 
         # Плотный shaping по разнице HP
-        for aid in self._agents_red:  rews[aid] += red_score  * 0.001
-        for aid in self._agents_blue: rews[aid] += blue_score * 0.001
+        for aid in self._agents_red:  
+            if aid in obs: rews[aid] += red_score  * 0.001
+        for aid in self._agents_blue: 
+            if aid in obs: rews[aid] += blue_score * 0.001
 
         # Бонус за победу/проигрыш
         if done:
             if red_alive and not blue_alive:
-                for aid in self._agents_red:  rews[aid] += 5.0
-                for aid in self._agents_blue: rews[aid] -= 5.0
+                for aid in self._agents_red:  
+                    if aid in obs: rews[aid] += 5.0
+                for aid in self._agents_blue: 
+                    if aid in obs: rews[aid] -= 5.0
             elif blue_alive and not red_alive:
-                for aid in self._agents_blue: rews[aid] += 5.0
-                for aid in self._agents_red:  rews[aid] -= 5.0
+                for aid in self._agents_blue: 
+                    if aid in obs: rews[aid] += 5.0
+                for aid in self._agents_red:  
+                    if aid in obs: rews[aid] -= 5.0
 
-        for aid in self._agents_red + self._agents_blue:
+        for aid in alive_agents:
             terms[aid] = False; truncs[aid] = False
         terms["__all__"] = False
         truncs["__all__"] = done
 
-        # 4) Infos: счётчики валидности + групповой ривард (для GSPO/GRPO)
-        red_step_sum  = sum(rews[a] for a in self._agents_red)  if self._agents_red  else 0.0
-        blue_step_sum = sum(rews[a] for a in self._agents_blue) if self._agents_blue else 0.0
+        # 4) ИСПРАВЛЕНИЕ: Infos только для агентов в obs
+        red_step_sum  = sum(rews.get(a, 0.0) for a in self._agents_red)
+        blue_step_sum = sum(rews.get(a, 0.0) for a in self._agents_blue)
 
-        for aid in self._agents_red + self._agents_blue:
+        for aid in alive_agents:
             infos[aid] = {
                 "invalid_target": self.count_invalid_target,
                 "oob_move": self.count_oob_move,
@@ -254,9 +266,10 @@ class ArenaEnv(MultiAgentEnv):
         for i, al in enumerate(allies):
             alive = int(self._is_alive(al))
             allies_mask[i] = alive
-            allies_arr[i, :2] = self._pos[al] - self._pos[aid]
-            allies_arr[i, 2] = self._hp[al] / 100.0
-            allies_arr[i, 3:] = self._vec(ALLY_FEATS - 3)
+            if alive:
+                allies_arr[i, :2] = self._pos[al] - self._pos[aid]
+                allies_arr[i, 2] = self._hp[al] / 100.0
+                allies_arr[i, 3:] = self._vec(ALLY_FEATS - 3)
 
         # Противники + action_mask (куда можно целиться)
         enemies = self._enemy_ids(aid)[:self.max_enemies]
@@ -267,9 +280,10 @@ class ArenaEnv(MultiAgentEnv):
             alive = int(self._is_alive(en))
             enemies_mask[j] = alive
             enemy_action_mask[j] = alive
-            enemies_arr[j, :2] = self._pos[en] - self._pos[aid]
-            enemies_arr[j, 2] = self._hp[en] / 100.0
-            enemies_arr[j, 3:] = self._vec(ENEMY_FEATS - 3)
+            if alive:
+                enemies_arr[j, :2] = self._pos[en] - self._pos[aid]
+                enemies_arr[j, 2] = self._hp[en] / 100.0
+                enemies_arr[j, 3:] = self._vec(ENEMY_FEATS - 3)
 
         # Глобальное состояние (для централизованного V)
         global_state = np.zeros((GLOBAL_FEATS,), dtype=np.float32)
@@ -284,12 +298,13 @@ class ArenaEnv(MultiAgentEnv):
         global_state[4:6] = blue_center
         global_state[6:] = self._vec(GLOBAL_FEATS - 6)
 
+        # ИСПРАВЛЕНИЕ: Клипинг всех значений к bounds [-10, 10]
         return {
-            "self": self_vec,
-            "allies": allies_arr,
+            "self": np.clip(self_vec, -10.0, 10.0),
+            "allies": np.clip(allies_arr, -10.0, 10.0),
             "allies_mask": allies_mask,
-            "enemies": enemies_arr,
+            "enemies": np.clip(enemies_arr, -10.0, 10.0),
             "enemies_mask": enemies_mask,
-            "global_state": global_state,
+            "global_state": np.clip(global_state, -10.0, 10.0),
             "enemy_action_mask": enemy_action_mask,
         }
