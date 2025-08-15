@@ -1,5 +1,5 @@
 """
-Callbacks для Ray 2.48+ - упрощенная стабильная версия
+Callbacks для Ray 2.48+ - исправленная версия с правильным доступом к окружению
 """
 
 from typing import Dict, Any, List, Optional
@@ -104,21 +104,21 @@ class LeagueCallbacks(RLlibCallback):
             self.writer.flush()
 
     def _play_match(self, algorithm: Algorithm, opp_id: str, episodes: int) -> tuple:
-        """Версия матча для Ray 2.48"""
+        """Исправленная версия матча для Ray 2.48"""
         try:
-            # Ray 2.48: пробуем новый API, fallback на старый
-            try:
-                env_runner = algorithm.env_runner_group.local_env_runner
-                env = env_runner.env
-            except AttributeError:
-                # Fallback на старый API
-                worker = algorithm.workers.local_worker()
-                env = worker.env
+            # Создаем временное окружение для матчей
+            from arena_env import ArenaEnv
+            
+            # Получаем конфиг окружения из алгоритма
+            env_config = algorithm.config.env_config.copy() if hasattr(algorithm.config, 'env_config') else {}
+            
+            # Создаем временное окружение
+            temp_env = ArenaEnv(env_config)
             
             wins_main, wins_opp = 0, 0
             
-            for _ in range(episodes):
-                obs, _ = env.reset()
+            for episode_idx in range(episodes):
+                obs, _ = temp_env.reset()
                 done = False
                 
                 while not done:
@@ -127,18 +127,26 @@ class LeagueCallbacks(RLlibCallback):
                     for aid, ob in obs.items():
                         pol_id = "main" if aid.startswith("red_") else opp_id
                         pol = algorithm.get_policy(pol_id)
+                        
+                        # Получаем действие от политики
                         act, _, _ = pol.compute_single_action(ob, explore=False)
                         
-                        action_dict[aid] = {
-                            "target": int(act[0]),
-                            "move": act[1:3],
-                            "aim": act[3:5],
-                            "fire": int(round(float(act[5]))),
-                        }
+                        # Преобразуем в правильный формат если нужно
+                        if isinstance(act, dict):
+                            action_dict[aid] = act
+                        else:
+                            # Если действие в виде массива, преобразуем в dict
+                            action_dict[aid] = {
+                                "target": int(act[0]) if len(act) > 0 else 0,
+                                "move": act[1:3] if len(act) > 2 else [0.0, 0.0],
+                                "aim": act[3:5] if len(act) > 4 else [0.0, 0.0],
+                                "fire": int(round(float(act[5]))) if len(act) > 5 else 0,
+                            }
                     
-                    obs, rews, terms, truncs, infos = env.step(action_dict)
+                    obs, rews, terms, truncs, infos = temp_env.step(action_dict)
                     done = terms.get("__all__", False) or truncs.get("__all__", False)
                 
+                # Подсчитываем победы
                 red_sum = sum(v for k, v in rews.items() if k.startswith("red_"))
                 blue_sum = sum(v for k, v in rews.items() if k.startswith("blue_"))
                 
@@ -151,20 +159,35 @@ class LeagueCallbacks(RLlibCallback):
             
         except Exception as e:
             print(f"Error in _play_match: {e}")
+            import traceback
+            traceback.print_exc()
             return 0, 0
 
     def _apply_curriculum(self, algorithm, ally_choices, enemy_choices):
         """Применение куррикулума для Ray 2.48"""
         try:
-            def set_curriculum_fn(env):
-                if hasattr(env, 'set_curriculum'):
-                    env.set_curriculum(ally_choices, enemy_choices)
+            # В Ray 2.48 env_runners заменили rollout_workers
+            # Но у нас нет прямого доступа к окружениям через них
+            # Поэтому будем менять конфиг алгоритма
             
-            # Ray 2.48: пробуем новый API
+            # Обновляем конфиг
+            if hasattr(algorithm.config, 'env_config'):
+                algorithm.config.env_config["ally_choices"] = ally_choices
+                algorithm.config.env_config["enemy_choices"] = enemy_choices
+                print(f"Updated curriculum in config: allies={ally_choices}, enemies={enemy_choices}")
+            
+            # Попытка применить к существующим env_runners если возможно
             try:
-                algorithm.env_runner_group.foreach_env(set_curriculum_fn)
-            except AttributeError:
-                # Fallback на старый API
-                algorithm.workers.foreach_env(set_curriculum_fn)
+                if hasattr(algorithm, 'env_runner_group') and algorithm.env_runner_group:
+                    # Это может не сработать, так как API изменился
+                    def set_curriculum_fn(env):
+                        if hasattr(env, 'set_curriculum'):
+                            env.set_curriculum(ally_choices, enemy_choices)
+                    
+                    algorithm.env_runner_group.foreach_env(set_curriculum_fn)
+                    print(f"Applied curriculum to env_runners: allies={ally_choices}, enemies={enemy_choices}")
+            except (AttributeError, Exception) as e:
+                print(f"Could not apply curriculum to existing envs: {e}")
+                
         except Exception as e:
             print(f"Could not apply curriculum: {e}")
