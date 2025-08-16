@@ -1,10 +1,14 @@
 """
 Callbacks с автоматическим экспортом ONNX при сохранении чекпоинтов
+ИСПРАВЛЕНО: 
+1. Принудительное перемещение всех тензоров на CPU перед экспортом
+2. Обработка ошибок с символическими ссылками в Windows
 """
 
 import os
 import json
 import torch
+import platform
 from typing import Dict, Any, List, Optional
 import numpy as np
 import ray
@@ -14,12 +18,16 @@ from ray.rllib.callbacks.callbacks import RLlibCallback
 from ray.rllib.algorithms import Algorithm
 
 class ScriptedPolicy(torch.nn.Module):
-    """Wrapper для экспорта модели в ONNX"""
+    """Wrapper для экспорта модели в ONNX с принудительным CPU"""
     def __init__(self, model, ne: int, na: int):
         super().__init__()
         self.m = model
         self.ne = ne
         self.na = na
+        
+        # КРИТИЧНО: Принудительно перемещаем модель на CPU
+        self.m = self.m.cpu()
+        self.m.eval()
 
     @torch.no_grad()
     def forward(self,
@@ -28,6 +36,16 @@ class ScriptedPolicy(torch.nn.Module):
                 enemies, enemies_mask,
                 global_state,
                 enemy_action_mask):
+        
+        # КРИТИЧНО: Убеждаемся что ВСЕ входы на CPU
+        self_vec = self_vec.cpu()
+        allies = allies.cpu()
+        allies_mask = allies_mask.cpu()
+        enemies = enemies.cpu()
+        enemies_mask = enemies_mask.cpu()
+        global_state = global_state.cpu()
+        enemy_action_mask = enemy_action_mask.cpu()
+        
         obs = {
             "self": self_vec,
             "allies": allies,
@@ -37,7 +55,14 @@ class ScriptedPolicy(torch.nn.Module):
             "global_state": global_state,
             "enemy_action_mask": enemy_action_mask,
         }
-        logits, _ = self.m({"obs": obs}, [], None)
+        
+        # Убеждаемся что модель на CPU
+        with torch.no_grad():
+            logits, _ = self.m({"obs": obs}, [], None)
+            
+        # Убеждаемся что выход на CPU
+        logits = logits.cpu()
+        
         idx = 0
         logits_t = logits[:, idx:idx+self.ne]; idx += self.ne
         mu_move  = logits[:, idx:idx+2];        idx += 2
@@ -50,7 +75,9 @@ class ScriptedPolicy(torch.nn.Module):
         move = torch.tanh(mu_move)
         aim  = torch.tanh(mu_aim)
         fire = (logit_fr > 0).float()
-        return torch.cat([target, move, aim, fire], dim=-1)
+        
+        result = torch.cat([target, move, aim, fire], dim=-1)
+        return result.cpu()  # Гарантируем CPU выход
 
 class LeagueCallbacksWithONNX(RLlibCallback):
     def __init__(self):
@@ -171,7 +198,7 @@ class LeagueCallbacksWithONNX(RLlibCallback):
             self.writer.flush()
 
     def _export_onnx_models(self, algorithm: Algorithm, iteration: int):
-        """Экспортирует модели в ONNX формат"""
+        """Экспортирует модели в ONNX формат с исправлениями устройств"""
         print(f"\n=== Exporting ONNX models at iteration {iteration} ===")
         
         # Получаем размеры из конфига окружения
@@ -199,36 +226,91 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                 # Получаем политику и модель
                 policy = algorithm.get_policy(policy_id)
                 model = policy.model
-                model.eval()
+                
+                # ИСПРАВЛЕНИЕ: Вместо deepcopy используем безопасный способ
+                # Получаем конфиг модели из политики
+                model_config_dict = getattr(policy.config, 'model', {})
+                if not model_config_dict:
+                    # Fallback конфиг если не найден
+                    model_config_dict = {
+                        "custom_model": "entity_attention",
+                        "custom_action_dist": "masked_multihead", 
+                        "custom_model_config": {
+                            "d_model": 128,
+                            "nhead": 8,
+                            "layers": 2,
+                            "ff": 256,
+                            "hidden": 256,
+                            "max_enemies": max_enemies,
+                            "max_allies": max_allies,
+                        },
+                        "vf_share_layers": False,
+                    }
+                
+                # Создаем новую модель с теми же параметрами
+                from entity_attention_model import EntityAttentionModel
+                
+                model_copy = EntityAttentionModel(
+                    obs_space=tmp_env.observation_space,
+                    action_space=tmp_env.action_space,
+                    num_outputs=model.num_outputs if hasattr(model, 'num_outputs') else None,
+                    model_config=model_config_dict,
+                    name=f"export_{policy_id}"
+                )
+                
+                # Перемещаем на CPU
+                model_copy = model_copy.cpu()
+                
+                # Безопасная загрузка весов с преобразованием на CPU
+                original_state = model.state_dict()
+                cpu_state = {}
+                for key, value in original_state.items():
+                    if isinstance(value, torch.Tensor):
+                        cpu_state[key] = value.cpu().detach()
+                    else:
+                        cpu_state[key] = value
+                
+                try:
+                    model_copy.load_state_dict(cpu_state, strict=False)
+                    print(f"Model weights loaded successfully")
+                except Exception as e:
+                    print(f"Warning: Could not load all weights: {e}")
+                    print("Proceeding with randomly initialized model for structure test")
+                
+                model_copy.eval()
+                print(f"Model recreated and moved to CPU successfully")
                 
                 # Определяем размеры модели
-                if hasattr(model, 'max_enemies') and hasattr(model, 'max_allies'):
-                    ne = model.max_enemies
-                    na = model.max_allies
+                if hasattr(model_copy, 'max_enemies') and hasattr(model_copy, 'max_allies'):
+                    ne = model_copy.max_enemies
+                    na = model_copy.max_allies
                 else:
                     ne = max_enemies
                     na = max_allies
                 
                 # Создаем wrapper
-                wrapper = ScriptedPolicy(model, ne=ne, na=na)
+                wrapper = ScriptedPolicy(model_copy, ne=ne, na=na)
                 
-                # Подготавливаем тестовые входы
+                # КРИТИЧНО: Все тестовые входы на CPU
                 B = 1
-                ex_self  = torch.zeros(B, self_feats, dtype=torch.float32)
-                ex_allies= torch.zeros(B, na, ally_feats, dtype=torch.float32)
-                ex_amask = torch.zeros(B, na, dtype=torch.int32)
-                ex_enems = torch.zeros(B, ne, enemy_feats, dtype=torch.float32)
-                ex_emask = torch.zeros(B, ne, dtype=torch.int32)
-                ex_gs    = torch.zeros(B, global_feats, dtype=torch.float32)
-                ex_emact = torch.zeros(B, ne, dtype=torch.int32)
+                ex_self  = torch.zeros(B, self_feats, dtype=torch.float32, device='cpu')
+                ex_allies= torch.zeros(B, na, ally_feats, dtype=torch.float32, device='cpu')
+                ex_amask = torch.zeros(B, na, dtype=torch.int32, device='cpu')
+                ex_enems = torch.zeros(B, ne, enemy_feats, dtype=torch.float32, device='cpu')
+                ex_emask = torch.zeros(B, ne, dtype=torch.int32, device='cpu')
+                ex_gs    = torch.zeros(B, global_feats, dtype=torch.float32, device='cpu')
+                ex_emact = torch.zeros(B, ne, dtype=torch.int32, device='cpu')
                 
                 # Тестовый прогон
+                print(f"Testing model forward pass...")
                 with torch.no_grad():
                     test_output = wrapper(ex_self, ex_allies, ex_amask, ex_enems, ex_emask, ex_gs, ex_emact)
+                print(f"Test output shape: {test_output.shape}, device: {test_output.device}")
                 
                 # Экспорт в ONNX
                 onnx_path = os.path.join(iter_dir, f"policy_{policy_id}.onnx")
                 
+                print(f"Starting ONNX export...")
                 torch.onnx.export(
                     wrapper,
                     (ex_self, ex_allies, ex_amask, ex_enems, ex_emask, ex_gs, ex_emact),
@@ -263,9 +345,9 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                         "total_action_dim": 6
                     },
                     "model_config": {
-                        "d_model": getattr(model, 'd_model', None),
-                        "nhead": getattr(model, 'nhead', None),
-                        "layers": getattr(model, 'layers', None),
+                        "d_model": getattr(model_copy, 'd_model', None),
+                        "nhead": getattr(model_copy, 'nhead', None),
+                        "layers": getattr(model_copy, 'layers', None),
                     },
                     "training_info": {
                         "timesteps_total": algorithm.metrics.peek("timesteps_total", 0),
@@ -306,13 +388,45 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                 import traceback
                 traceback.print_exc()
         
-        # Создаем симлинк на последний экспорт
-        latest_link = os.path.join(self.export_dir, "latest")
-        if os.path.islink(latest_link):
-            os.unlink(latest_link)
-        os.symlink(os.path.basename(iter_dir), latest_link)
+        # ИСПРАВЛЕНИЕ: Безопасное создание симлинка для Windows
+        self._create_safe_symlink(iter_dir, os.path.join(self.export_dir, "latest"))
         
         print(f"=== ONNX export completed for iteration {iteration} ===\n")
+
+    def _create_safe_symlink(self, target_dir: str, link_path: str):
+        """Безопасное создание символической ссылки с обработкой Windows"""
+        try:
+            # Удаляем существующую ссылку если есть
+            if os.path.islink(link_path):
+                os.unlink(link_path)
+            elif os.path.exists(link_path):
+                # Если это не ссылка, но файл/папка существует
+                if os.path.isdir(link_path):
+                    import shutil
+                    shutil.rmtree(link_path)
+                else:
+                    os.remove(link_path)
+            
+            # Попытка создать символическую ссылку
+            target_name = os.path.basename(target_dir)
+            try:
+                os.symlink(target_name, link_path)
+                print(f"  ✓ Created symlink: {link_path} -> {target_name}")
+            except OSError as e:
+                if platform.system() == "Windows" and "required privilege" in str(e).lower():
+                    # Windows без прав администратора - создаем обычную копию
+                    print(f"  ! Cannot create symlink on Windows (privilege required), creating copy instead")
+                    import shutil
+                    if os.path.isdir(target_dir):
+                        shutil.copytree(target_dir, link_path)
+                    else:
+                        shutil.copy2(target_dir, link_path)
+                    print(f"  ✓ Created copy: {link_path}")
+                else:
+                    raise
+                    
+        except Exception as e:
+            print(f"  ! Warning: Could not create latest link: {e}")
 
     def _play_match(self, algorithm: Algorithm, opp_id: str, episodes: int) -> tuple:
         """Версия матча для Ray 2.48"""

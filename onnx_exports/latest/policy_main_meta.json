@@ -1,0 +1,29 @@
+{
+  "iteration": 1,
+  "policy_id": "main",
+  "max_allies": 6,
+  "max_enemies": 6,
+  "obs_dims": {
+    "self": 12,
+    "ally": 8,
+    "enemy": 10,
+    "global_state": 64
+  },
+  "action_spec": {
+    "target_discrete_n": 6,
+    "move_box": 2,
+    "aim_box": 2,
+    "fire_binary": 1,
+    "total_action_dim": 6
+  },
+  "input_names": [
+    "self_vec",
+    "allies",
+    "allies_mask",
+    "enemies",
+    "enemies_mask",
+    "enemy_action_mask"
+  ],
+  "export_method": "PolicyOnlyONNXWrapper",
+  "note": "Policy-only export without value function (no global_state input)"
+}

@@ -10,10 +10,12 @@ from ray.rllib.models import ModelCatalog
 from ray.tune.registry import register_env
 
 from arena_env import ArenaEnv
-from entity_attention_model import EntityAttentionModel   
+from entity_attention_model import ONNXEntityAttentionModel 
 from masked_multihead_dist import MaskedTargetMoveAimFire 
 from league_state import LeagueState
 from selfplay_league_callbacks import LeagueCallbacks
+from onnx_callbacks import LeagueCallbacksWithONNX
+from simple_onnx import FinalONNXCallbacks
 from gspo_grpo_policy import GSPOTorchPolicy, GRPOTorchPolicy
 import torch
 
@@ -25,7 +27,7 @@ def main():
     ray.init(ignore_reinit_error=True)
 
     register_env("ArenaEnv", env_creator)
-    ModelCatalog.register_custom_model("entity_attention", EntityAttentionModel)
+    ModelCatalog.register_custom_model("entity_attention", ONNXEntityAttentionModel)
     ModelCatalog.register_custom_action_dist("masked_multihead", MaskedTargetMoveAimFire)
 
     opponent_ids = [f"opponent_{i}" for i in range(6)]
@@ -156,9 +158,44 @@ def main():
             ]
         )
         return callbacks
+    
+    def create_callbacks_onnx():
+        """Фабрика для создания callbacks с правильными параметрами"""
+        callbacks = LeagueCallbacksWithONNX()
+        callbacks.setup(
+            league_actor=league,
+            opponent_ids=opponent_ids,
+            eval_episodes=4,
+            clone_every_iters=15,
+            curriculum_schedule=[
+                (0, [1], [1]),
+                (2_000_000, [1, 2], [1, 2]),
+                (8_000_000, [1, 2, 3], [1, 2, 3]),
+            ],            
+            # ONNX экспорт настройки
+            export_onnx=True,
+            export_every=1,  # Каждые 25 итераций
+            export_dir="./onnx_exports",
+            policies_to_export=["main"],  # Можно добавить opponent_0, opponent_1, etc.
+            
+        )
+        return callbacks
+    
+    def create_callbacks_onnx_simp():
+        """Создание упрощенных callbacks только для ONNX экспорта"""
+        callbacks = FinalONNXCallbacks()
+        callbacks.setup(
+            export_onnx=True,
+            export_every=1,  # Экспорт каждые 5 итераций для тестирования
+            export_dir="./onnx_exports",
+            policies_to_export=["main"]
+        )
+        return callbacks
 
     # Передаем функцию, а не объект
-    config = config.callbacks(create_callbacks)
+    # config = config.callbacks(create_callbacks)
+    # config = config.callbacks(create_callbacks_onnx)
+    config = config.callbacks(create_callbacks_onnx_simp)
 
     # ИЛИ альтернативный способ - через лямбду:
     # config = config.callbacks(lambda: LeagueCallbacks().setup(
@@ -200,10 +237,10 @@ def main():
     
     # Основной цикл тренировки
     try:
-        for i in range(2000):
+        for i in range(1):
             result = algo.train()
             
-            if i % 10 == 0:
+            if i % 10 == 2:
                 # Ray 2.48 - метрики в env_runners
                 episode_reward_mean = result.get("env_runners", {}).get("episode_reward_mean", 0)
                 timesteps_total = result.get("timesteps_total", 0)
@@ -213,7 +250,7 @@ def main():
                 
                 # Сохранение чекпоинта
                 checkpoint = algo.save()
-                if i % 50 == 0:
+                if i % 2 == 0:
                     print(f"Checkpoint saved: {checkpoint}")
                     
     except KeyboardInterrupt:
