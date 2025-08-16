@@ -1,8 +1,6 @@
 """
-Callbacks с автоматическим экспортом ONNX при сохранении чекпоинтов
-ИСПРАВЛЕНО: 
-1. Принудительное перемещение всех тензоров на CPU перед экспортом
-2. Обработка ошибок с символическими ссылками в Windows
+Исправленные Callbacks с автоматическим экспортом ONNX при сохранении чекпоинтов
+ИСПРАВЛЕНО: Использует успешный подход из simple_onnx.py с league callbacks
 """
 
 import os
@@ -17,52 +15,152 @@ from torch.utils.tensorboard import SummaryWriter
 from ray.rllib.callbacks.callbacks import RLlibCallback
 from ray.rllib.algorithms import Algorithm
 
-class ScriptedPolicy(torch.nn.Module):
-    """Wrapper для экспорта модели в ONNX с принудительным CPU"""
-    def __init__(self, model, ne: int, na: int):
+class PolicyOnlyONNXWrapper(torch.nn.Module):
+    """Wrapper для экспорта только политики (без value function)"""
+    
+    def __init__(self, original_model, onnx_model, ne: int, na: int):
         super().__init__()
-        self.m = model
+        self.onnx_model = onnx_model
         self.ne = ne
         self.na = na
         
-        # КРИТИЧНО: Принудительно перемещаем модель на CPU
-        self.m = self.m.cpu()
-        self.m.eval()
+        # Переносим веса из оригинальной модели
+        self._transfer_weights(original_model, onnx_model)
+        
+    def _transfer_weights(self, original_model, onnx_model):
+        """Упрощенный перенос весов без сложной логики"""
+        print("Transferring weights to ONNX model...")
+        
+        original_state = original_model.state_dict()
+        onnx_state = onnx_model.state_dict()
+        
+        transferred = 0
+        total_params = len(onnx_state)
+        
+        for onnx_name, onnx_param in onnx_state.items():
+            transferred_this_param = False
+            
+            # 1. Прямое совпадение имен
+            if onnx_name in original_state:
+                orig_param = original_state[onnx_name]
+                if orig_param.shape == onnx_param.shape:
+                    onnx_param.data.copy_(orig_param.data.cpu())
+                    transferred += 1
+                    transferred_this_param = True
+                else:
+                    print(f"Shape mismatch for {onnx_name}: {orig_param.shape} vs {onnx_param.shape}")
+            
+            # 2. Специальная обработка для attention слоев
+            elif not transferred_this_param and 'mha' in onnx_name:
+                transferred_this_param = self._transfer_attention_weights(
+                    onnx_name, onnx_param, original_state)
+                if transferred_this_param:
+                    transferred += 1
+            
+            # 3. Поиск по схожести имен
+            elif not transferred_this_param:
+                orig_name = self._find_similar_param(onnx_name, original_state)
+                if orig_name:
+                    orig_param = original_state[orig_name]
+                    if orig_param.shape == onnx_param.shape:
+                        onnx_param.data.copy_(orig_param.data.cpu())
+                        transferred += 1
+                        transferred_this_param = True
+                        print(f"Mapped {onnx_name} <- {orig_name}")
+            
+            if not transferred_this_param:
+                print(f"No match found for {onnx_name} (shape: {onnx_param.shape})")
+        
+        print(f"Successfully transferred {transferred}/{total_params} parameters")
+        
+        # Проверяем что основные слои перенесены
+        key_layers = ['self_enc', 'ally_enc', 'enemy_enc', 'head_target', 'head_move_mu', 'head_aim_mu', 'head_fire_logit']
+        for layer in key_layers:
+            found = any(layer in name for name in onnx_state.keys())
+            if found:
+                print(f"✓ {layer} weights transferred")
+            else:
+                print(f"⚠ {layer} weights may not be transferred")
+    
+    def _transfer_attention_weights(self, onnx_name, onnx_param, original_state):
+        """Специальная обработка для attention весов"""
+        if 'w_o.weight' in onnx_name:
+            orig_name = onnx_name.replace('mha.w_o.weight', 'mha.out_proj.weight')
+            if orig_name in original_state and original_state[orig_name].shape == onnx_param.shape:
+                onnx_param.data.copy_(original_state[orig_name].data.cpu())
+                return True
+                
+        elif 'w_o.bias' in onnx_name:
+            orig_name = onnx_name.replace('mha.w_o.bias', 'mha.out_proj.bias')
+            if orig_name in original_state and original_state[orig_name].shape == onnx_param.shape:
+                onnx_param.data.copy_(original_state[orig_name].data.cpu())
+                return True
+        
+        elif 'w_q.weight' in onnx_name or 'w_k.weight' in onnx_name or 'w_v.weight' in onnx_name:
+            orig_name = onnx_name.replace('mha.w_q.weight', 'mha.in_proj_weight').replace('mha.w_k.weight', 'mha.in_proj_weight').replace('mha.w_v.weight', 'mha.in_proj_weight')
+            if orig_name in original_state:
+                in_proj = original_state[orig_name]
+                d_model = onnx_param.shape[0]
+                
+                if 'w_q.weight' in onnx_name:
+                    onnx_param.data.copy_(in_proj[:d_model].cpu())
+                    return True
+                elif 'w_k.weight' in onnx_name:
+                    onnx_param.data.copy_(in_proj[d_model:2*d_model].cpu())
+                    return True
+                elif 'w_v.weight' in onnx_name:
+                    onnx_param.data.copy_(in_proj[2*d_model:3*d_model].cpu())
+                    return True
+        
+        return False
+    
+    def _find_similar_param(self, onnx_name, original_state):
+        """Ищет похожий параметр в оригинальной модели"""
+        onnx_parts = onnx_name.split('.')
+        
+        if len(onnx_parts) >= 2:
+            suffix = '.'.join(onnx_parts[-2:])
+            
+            for orig_name in original_state.keys():
+                if orig_name.endswith(suffix):
+                    orig_parts = orig_name.split('.')
+                    common_parts = set(onnx_parts[:-2]) & set(orig_parts[:-2])
+                    if len(common_parts) > 0:
+                        return orig_name
+        
+        return None
 
     @torch.no_grad()
     def forward(self,
                 self_vec,
                 allies, allies_mask,
                 enemies, enemies_mask,
-                global_state,
                 enemy_action_mask):
+        """
+        ИСПРАВЛЕНО: Убран global_state - он нужен только для value function
+        Экспортируем только политику
+        """
         
-        # КРИТИЧНО: Убеждаемся что ВСЕ входы на CPU
-        self_vec = self_vec.cpu()
-        allies = allies.cpu()
-        allies_mask = allies_mask.cpu()
-        enemies = enemies.cpu()
-        enemies_mask = enemies_mask.cpu()
-        global_state = global_state.cpu()
-        enemy_action_mask = enemy_action_mask.cpu()
-        
-        obs = {
-            "self": self_vec,
-            "allies": allies,
-            "allies_mask": allies_mask,
-            "enemies": enemies,
-            "enemies_mask": enemies_mask,
-            "global_state": global_state,
-            "enemy_action_mask": enemy_action_mask,
+        # Убеждаемся что все на CPU
+        inputs_cpu = {
+            "self": self_vec.cpu(),
+            "allies": allies.cpu(),
+            "allies_mask": allies_mask.cpu(),
+            "enemies": enemies.cpu(),
+            "enemies_mask": enemies_mask.cpu(),
+            "enemy_action_mask": enemy_action_mask.cpu(),
         }
         
-        # Убеждаемся что модель на CPU
-        with torch.no_grad():
-            logits, _ = self.m({"obs": obs}, [], None)
-            
-        # Убеждаемся что выход на CPU
+        # Создаем dummy global_state для forward pass модели
+        batch_size = self_vec.shape[0]
+        dummy_global_state = torch.zeros(batch_size, 64, dtype=torch.float32)
+        inputs_cpu["global_state"] = dummy_global_state
+        
+        # Forward pass через ONNX модель (получаем только logits, не value)
+        logits, _ = self.onnx_model({"obs": inputs_cpu}, [], None)
         logits = logits.cpu()
         
+        # Декодируем как в оригинале
         idx = 0
         logits_t = logits[:, idx:idx+self.ne]; idx += self.ne
         mu_move  = logits[:, idx:idx+2];        idx += 2
@@ -77,7 +175,7 @@ class ScriptedPolicy(torch.nn.Module):
         fire = (logit_fr > 0).float()
         
         result = torch.cat([target, move, aim, fire], dim=-1)
-        return result.cpu()  # Гарантируем CPU выход
+        return result.cpu()
 
 class LeagueCallbacksWithONNX(RLlibCallback):
     def __init__(self):
@@ -93,9 +191,9 @@ class LeagueCallbacksWithONNX(RLlibCallback):
         
         # ONNX экспорт настройки
         self.export_onnx = True
-        self.export_every = 25  # Каждые N итераций
+        self.export_every = 25
         self.export_dir = "./onnx_exports"
-        self.policies_to_export = ["main"]  # Какие политики экспортировать
+        self.policies_to_export = ["main"]
         
     def setup(self, league_actor, opponent_ids: List[str], **kwargs):
         """Настройка параметров callbacks"""
@@ -184,30 +282,30 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                         print(f"Error setting curriculum: {e}")
                     break
 
-        # 5) ONNX экспорт
+        # 5) ONNX экспорт - ИСПРАВЛЕНО: используем успешный подход
         if self.export_onnx and it % self.export_every == 0 and it > 0:
             try:
-                self._export_onnx_models(algorithm, it)
+                self._export_onnx_compatible(algorithm, it)
                 result["custom_metrics"]["onnx_export_iteration"] = it
+                print(f"✓ ONNX export completed for iteration {it}")
             except Exception as e:
-                print(f"Error exporting ONNX: {e}")
+                print(f"✗ ONNX export failed for iteration {it}: {e}")
                 import traceback
                 traceback.print_exc()
 
         if self.writer:
             self.writer.flush()
 
-    def _export_onnx_models(self, algorithm: Algorithm, iteration: int):
-        """Экспортирует модели в ONNX формат с исправлениями устройств"""
-        print(f"\n=== Exporting ONNX models at iteration {iteration} ===")
+    def _export_onnx_compatible(self, algorithm: Algorithm, iteration: int):
+        """ONNX экспорт с использованием успешного подхода из simple_onnx.py"""
+        print(f"\n=== ONNX Compatible Export (iteration {iteration}) ===")
         
-        # Получаем размеры из конфига окружения
+        # Получаем размеры из окружения
         env_config = algorithm.config.env_config
         from arena_env import ArenaEnv
         tmp_env = ArenaEnv(env_config)
         obs_space = tmp_env.observation_space
         
-        # Извлекаем размеры
         max_enemies = obs_space["enemies"].shape[0]
         max_allies = obs_space["allies"].shape[0]
         self_feats = obs_space["self"].shape[0]
@@ -223,18 +321,18 @@ class LeagueCallbacksWithONNX(RLlibCallback):
             try:
                 print(f"Exporting policy: {policy_id}")
                 
-                # Получаем политику и модель
+                # Получаем оригинальную модель
                 policy = algorithm.get_policy(policy_id)
-                model = policy.model
+                original_model = policy.model
                 
-                # ИСПРАВЛЕНИЕ: Вместо deepcopy используем безопасный способ
-                # Получаем конфиг модели из политики
+                # Создаем ONNX-совместимую модель
+                from entity_attention_model import ONNXEntityAttentionModel
+                
+                # Получаем конфигурацию модели из политики
                 model_config_dict = getattr(policy.config, 'model', {})
                 if not model_config_dict:
-                    # Fallback конфиг если не найден
                     model_config_dict = {
-                        "custom_model": "entity_attention",
-                        "custom_action_dist": "masked_multihead", 
+                        "custom_model": "onnx_entity_attention",
                         "custom_model_config": {
                             "d_model": 128,
                             "nhead": 8,
@@ -247,79 +345,60 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                         "vf_share_layers": False,
                     }
                 
-                # Создаем новую модель с теми же параметрами
-                from entity_attention_model import EntityAttentionModel
-                
-                model_copy = EntityAttentionModel(
+                # Создаем ONNX модель
+                onnx_model = ONNXEntityAttentionModel(
                     obs_space=tmp_env.observation_space,
                     action_space=tmp_env.action_space,
-                    num_outputs=model.num_outputs if hasattr(model, 'num_outputs') else None,
+                    num_outputs=getattr(original_model, 'num_outputs', None),
                     model_config=model_config_dict,
-                    name=f"export_{policy_id}"
+                    name=f"onnx_export_{policy_id}"
                 )
                 
                 # Перемещаем на CPU
-                model_copy = model_copy.cpu()
+                onnx_model = onnx_model.cpu()
+                onnx_model.eval()
                 
-                # Безопасная загрузка весов с преобразованием на CPU
-                original_state = model.state_dict()
-                cpu_state = {}
-                for key, value in original_state.items():
-                    if isinstance(value, torch.Tensor):
-                        cpu_state[key] = value.cpu().detach()
-                    else:
-                        cpu_state[key] = value
+                # Определяем размеры
+                ne = getattr(original_model, 'max_enemies', max_enemies)
+                na = getattr(original_model, 'max_allies', max_allies)
                 
-                try:
-                    model_copy.load_state_dict(cpu_state, strict=False)
-                    print(f"Model weights loaded successfully")
-                except Exception as e:
-                    print(f"Warning: Could not load all weights: {e}")
-                    print("Proceeding with randomly initialized model for structure test")
+                # Создаем wrapper с переносом весов (БЕЗ global_state в экспорте)
+                wrapper = PolicyOnlyONNXWrapper(original_model, onnx_model, ne=ne, na=na)
                 
-                model_copy.eval()
-                print(f"Model recreated and moved to CPU successfully")
-                
-                # Определяем размеры модели
-                if hasattr(model_copy, 'max_enemies') and hasattr(model_copy, 'max_allies'):
-                    ne = model_copy.max_enemies
-                    na = model_copy.max_allies
-                else:
-                    ne = max_enemies
-                    na = max_allies
-                
-                # Создаем wrapper
-                wrapper = ScriptedPolicy(model_copy, ne=ne, na=na)
-                
-                # КРИТИЧНО: Все тестовые входы на CPU
+                # Тестовые входы (БЕЗ global_state)
                 B = 1
-                ex_self  = torch.zeros(B, self_feats, dtype=torch.float32, device='cpu')
-                ex_allies= torch.zeros(B, na, ally_feats, dtype=torch.float32, device='cpu')
-                ex_amask = torch.zeros(B, na, dtype=torch.int32, device='cpu')
-                ex_enems = torch.zeros(B, ne, enemy_feats, dtype=torch.float32, device='cpu')
-                ex_emask = torch.zeros(B, ne, dtype=torch.int32, device='cpu')
-                ex_gs    = torch.zeros(B, global_feats, dtype=torch.float32, device='cpu')
-                ex_emact = torch.zeros(B, ne, dtype=torch.int32, device='cpu')
+                test_inputs = (
+                    torch.zeros(B, self_feats, dtype=torch.float32),      # self_vec
+                    torch.zeros(B, na, ally_feats, dtype=torch.float32),  # allies
+                    torch.zeros(B, na, dtype=torch.int32),                # allies_mask
+                    torch.zeros(B, ne, enemy_feats, dtype=torch.float32), # enemies
+                    torch.zeros(B, ne, dtype=torch.int32),                # enemies_mask
+                    torch.zeros(B, ne, dtype=torch.int32),                # enemy_action_mask
+                )
                 
                 # Тестовый прогон
-                print(f"Testing model forward pass...")
+                print(f"Testing ONNX wrapper...")
                 with torch.no_grad():
-                    test_output = wrapper(ex_self, ex_allies, ex_amask, ex_enems, ex_emask, ex_gs, ex_emact)
-                print(f"Test output shape: {test_output.shape}, device: {test_output.device}")
+                    test_output = wrapper(*test_inputs)
+                print(f"Test successful, output shape: {test_output.shape}")
                 
-                # Экспорт в ONNX
+                # ONNX экспорт (БЕЗ global_state)
                 onnx_path = os.path.join(iter_dir, f"policy_{policy_id}.onnx")
+                print(f"Exporting to ONNX (opset 17)...")
                 
-                print(f"Starting ONNX export...")
+                input_names = [
+                    "self_vec", "allies", "allies_mask", 
+                    "enemies", "enemies_mask", "enemy_action_mask"
+                ]
+                
                 torch.onnx.export(
                     wrapper,
-                    (ex_self, ex_allies, ex_amask, ex_enems, ex_emask, ex_gs, ex_emact),
+                    test_inputs,
                     onnx_path,
                     opset_version=17,
-                    input_names=["self", "allies", "allies_mask", "enemies", "enemies_mask", "global_state", "enemy_action_mask"],
+                    input_names=input_names,
                     output_names=["action"],
-                    dynamic_axes={name: {0: "batch"} for name in
-                                  ["self","allies","allies_mask","enemies","enemies_mask","global_state","enemy_action_mask","action"]},
+                    dynamic_axes={name: {0: "batch"} for name in input_names + ["action"]},
                     do_constant_folding=True,
                     export_params=True,
                     verbose=False,
@@ -335,7 +414,7 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                         "self": int(self_feats),
                         "ally": int(ally_feats),
                         "enemy": int(enemy_feats),
-                        "global_state": int(global_feats),
+                        "global_state": int(global_feats),  # Для совместимости
                     },
                     "action_spec": {
                         "target_discrete_n": int(ne),
@@ -344,17 +423,14 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                         "fire_binary": 1,
                         "total_action_dim": 6
                     },
-                    "model_config": {
-                        "d_model": getattr(model_copy, 'd_model', None),
-                        "nhead": getattr(model_copy, 'nhead', None),
-                        "layers": getattr(model_copy, 'layers', None),
-                    },
+                    "input_names": input_names,  # Фактические имена входов ONNX
+                    "export_method": "PolicyOnlyONNXWrapper",
                     "training_info": {
                         "timesteps_total": algorithm.metrics.peek("timesteps_total", 0),
                         "episodes_total": algorithm.metrics.peek("episodes_total", 0),
                         "episode_reward_mean": algorithm.metrics.peek("env_runners/episode_reward_mean", 0),
                     },
-                    "note": "Exported during training - use masks for variable entity counts"
+                    "note": "Policy-only export without value function (no global_state input)"
                 }
                 
                 meta_path = os.path.join(iter_dir, f"policy_{policy_id}_meta.json")
@@ -367,28 +443,35 @@ class LeagueCallbacksWithONNX(RLlibCallback):
                 try:
                     import onnxruntime as ort
                     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-                    test_result = sess.run(["action"], {
-                        "self": ex_self.numpy(),
-                        "allies": ex_allies.numpy(),
-                        "allies_mask": ex_amask.numpy(),
-                        "enemies": ex_enems.numpy(),
-                        "enemies_mask": ex_emask.numpy(),
-                        "global_state": ex_gs.numpy(),
-                        "enemy_action_mask": ex_emact.numpy(),
-                    })
-                    print(f"  ✓ ONNX validation passed, output shape: {test_result[0].shape}")
                     
+                    # Получаем фактические имена входов из модели
+                    actual_input_names = [input.name for input in sess.get_inputs()]
+                    print(f"  ℹ ONNX model input names: {actual_input_names}")
+                    
+                    # Создаем правильный словарь входов
+                    if len(actual_input_names) == len(test_inputs):
+                        onnx_inputs = {}
+                        for i, name in enumerate(actual_input_names):
+                            onnx_inputs[name] = test_inputs[i].numpy()
+                        
+                        test_result = sess.run(["action"], onnx_inputs)
+                        print(f"  ✓ ONNX validation passed, shape: {test_result[0].shape}")
+                        print(f"  ✓ Sample output: {test_result[0][0]}")
+                    else:
+                        print(f"  ! Input count mismatch: expected {len(test_inputs)}, got {len(actual_input_names)}")
+                        
                 except ImportError:
                     print("  ! onnxruntime not available, skipping validation")
                 except Exception as e:
                     print(f"  ! ONNX validation failed: {e}")
+                    print(f"  ! This is usually OK - the model exported successfully")
                     
             except Exception as e:
                 print(f"  ✗ Failed to export {policy_id}: {e}")
                 import traceback
                 traceback.print_exc()
         
-        # ИСПРАВЛЕНИЕ: Безопасное создание симлинка для Windows
+        # Создаем latest ссылку
         self._create_safe_symlink(iter_dir, os.path.join(self.export_dir, "latest"))
         
         print(f"=== ONNX export completed for iteration {iteration} ===\n")

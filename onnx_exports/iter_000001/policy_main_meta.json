@@ -25,5 +25,10 @@
     "enemy_action_mask"
   ],
   "export_method": "PolicyOnlyONNXWrapper",
+  "training_info": {
+    "timesteps_total": 0,
+    "episodes_total": 0,
+    "episode_reward_mean": 0
+  },
   "note": "Policy-only export without value function (no global_state input)"
 }

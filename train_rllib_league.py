@@ -194,8 +194,8 @@ def main():
 
     # Передаем функцию, а не объект
     # config = config.callbacks(create_callbacks)
-    # config = config.callbacks(create_callbacks_onnx)
-    config = config.callbacks(create_callbacks_onnx_simp)
+    config = config.callbacks(create_callbacks_onnx)
+    # config = config.callbacks(create_callbacks_onnx_simp)
 
     # ИЛИ альтернативный способ - через лямбду:
     # config = config.callbacks(lambda: LeagueCallbacks().setup(

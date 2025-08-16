@@ -286,8 +286,8 @@ class ArenaEnv(MultiAgentEnv):
         truncs["__all__"] = done
 
         # 4) Infos только для агентов в obs
-        red_step_sum  = float(sum(rews.get(a, 0.0) for a in self._agents_red))  # Python float
-        blue_step_sum = float(sum(rews.get(a, 0.0) for a in self._agents_blue)) # Python float
+        red_step_sum = float(np.clip(sum(rews.get(a, 0.0) for a in self._agents_red), -100.0, 100.0))
+        blue_step_sum = float(np.clip(sum(rews.get(a, 0.0) for a in self._agents_blue), -100.0, 100.0))
 
         for aid in alive_agents:
             infos[aid] = {
