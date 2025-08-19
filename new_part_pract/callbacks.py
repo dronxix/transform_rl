@@ -1,5 +1,6 @@
 """
 Обновленные callbacks с исправленным ONNX экспортом и записью боев
+ИСПРАВЛЕНИЕ: Добавлен обязательный параметр algorithm в on_episode_end
 """
 
 import os
@@ -21,6 +22,7 @@ class FixedLeagueCallbacksWithONNXAndRecording(RLlibCallback):
     1. Правильным ONNX экспортом с meta.json файлами
     2. Записью боев для визуализации
     3. Улучшенной обработкой ошибок
+    4. ИСПРАВЛЕНА сигнатура on_episode_end для Ray 2.48+
     """
     
     def __init__(self):
@@ -312,7 +314,10 @@ class FixedLeagueCallbacksWithONNXAndRecording(RLlibCallback):
 
     def on_episode_end(self, *, algorithm: Algorithm, base_env, policies: Dict[str, Any], 
                       episode, env_index: Optional[int] = None, **kwargs) -> None:
-        """Обработка окончания эпизода"""
+        """
+        ИСПРАВЛЕНО: Добавлен обязательный параметр algorithm для Ray 2.48+
+        Обработка окончания эпизода
+        """
         
         try:
             # Записываем дополнительную статистику эпизода
@@ -508,7 +513,7 @@ def test_onnx_export_standalone():
             print(f"✅ ONNX export test PASSED! Exported {len(successful_exports)} policies")
             
             # Тестируем инференс
-            from onnx_callbacks import run_inference_test
+            from infer_onnx import run_inference_test
             
             for export in successful_exports:
                 onnx_path = export["onnx_path"]
