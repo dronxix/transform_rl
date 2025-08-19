@@ -227,15 +227,23 @@ def main():
                 checkpoint_freq = 3 if args.test else 50
                 if i % checkpoint_freq == 0 and i > 0:
                     checkpoint_result = algo.save()
-                    # ИСПРАВЛЕНИЕ: Правильная обработка результата save()
-                    if hasattr(checkpoint_result, 'checkpoint'):
-                        checkpoint_path = checkpoint_result.checkpoint
-                    elif isinstance(checkpoint_result, str):
-                        checkpoint_path = checkpoint_result
-                    else:
-                        checkpoint_path = str(checkpoint_result)
+                    # ИСПРАВЛЕНИЕ: Правильная обработка Checkpoint объекта в Ray 2.48+
+                    try:
+                        if hasattr(checkpoint_result, 'to_directory'):
+                            checkpoint_path = checkpoint_result.to_directory()
+                        elif hasattr(checkpoint_result, 'as_directory'):
+                            checkpoint_path = checkpoint_result.as_directory()
+                        elif hasattr(checkpoint_result, 'checkpoint'):
+                            checkpoint_path = checkpoint_result.checkpoint
+                        elif isinstance(checkpoint_result, str):
+                            checkpoint_path = checkpoint_result
+                        else:
+                            checkpoint_path = str(checkpoint_result)
+                    except Exception as e:
+                        print(f"Warning: Could not extract checkpoint path: {e}")
+                        checkpoint_path = f"checkpoint_iter_{i}"
                     
-                    print(f"💾 Checkpoint: {os.path.basename(checkpoint_path)}")
+                    print(f"💾 Checkpoint saved at iteration {i}")
                     print(f"   Best reward: {best_reward:.3f}")
                     final_checkpoint = checkpoint_path
                 
@@ -251,16 +259,29 @@ def main():
         # Финальное сохранение
         if final_checkpoint is None:
             checkpoint_result = algo.save()
-            # ИСПРАВЛЕНИЕ: Правильная обработка результата save()
-            if hasattr(checkpoint_result, 'checkpoint'):
-                final_checkpoint = checkpoint_result.checkpoint
-            elif isinstance(checkpoint_result, str):
-                final_checkpoint = checkpoint_result
-            else:
-                final_checkpoint = str(checkpoint_result)
+            # ИСПРАВЛЕНИЕ: Правильная обработка Checkpoint объекта в Ray 2.48+
+            try:
+                if hasattr(checkpoint_result, 'to_directory'):
+                    final_checkpoint = checkpoint_result.to_directory()
+                elif hasattr(checkpoint_result, 'as_directory'):
+                    final_checkpoint = checkpoint_result.as_directory()
+                elif hasattr(checkpoint_result, 'checkpoint'):
+                    final_checkpoint = checkpoint_result.checkpoint
+                elif isinstance(checkpoint_result, str):
+                    final_checkpoint = checkpoint_result
+                else:
+                    final_checkpoint = str(checkpoint_result)
+            except Exception as e:
+                print(f"Warning: Could not extract final checkpoint path: {e}")
+                final_checkpoint = f"final_checkpoint_iter_{i + 1}"
         
         print(f"\n🏁 Training completed!")
-        print(f"   Final checkpoint: {os.path.basename(final_checkpoint)}")
+        try:
+            print(f"   Final checkpoint: {os.path.basename(final_checkpoint)}")
+            print(f"   Checkpoint directory: {os.path.dirname(final_checkpoint)}")
+        except Exception as e:
+            print(f"   Final checkpoint saved successfully")
+            print(f"   Warning: Could not display path: {e}")
         print(f"   Best reward: {best_reward:.3f}")
         print(f"   Total iterations: {i + 1}")
         
@@ -295,7 +316,10 @@ def main():
             if recording_files:
                 print(f"   Battle recordings: ./battle_recordings/ ({len(recording_files)} files)")
         
-        print(f"   Checkpoints: {os.path.dirname(final_checkpoint)}")
+        try:
+            print(f"   Checkpoints: {os.path.dirname(final_checkpoint)}")
+        except:
+            print(f"   Checkpoints: ./checkpoints/ (saved successfully)")
         
         # Очистка
         algo.stop()

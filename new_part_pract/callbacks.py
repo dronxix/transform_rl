@@ -312,10 +312,10 @@ class FixedLeagueCallbacksWithONNXAndRecording(RLlibCallback):
         except Exception as e:
             print(f"❌ Could not apply curriculum: {e}")
 
-    def on_episode_end(self, *, algorithm: Algorithm, base_env, policies: Dict[str, Any], 
+    def on_episode_end(self, *, base_env, policies: Dict[str, Any], 
                       episode, env_index: Optional[int] = None, **kwargs) -> None:
         """
-        ИСПРАВЛЕНО: Добавлен обязательный параметр algorithm для Ray 2.48+
+        ИСПРАВЛЕНО: Убран обязательный параметр algorithm для совместимости с Ray 2.48+
         Обработка окончания эпизода
         """
         
@@ -353,7 +353,7 @@ class FixedLeagueCallbacksWithONNXAndRecording(RLlibCallback):
             # Полностью безопасная обработка - если что-то пошло не так, просто пропускаем
             pass
 
-    def on_sample_end(self, *, algorithm: Algorithm, samples, **kwargs) -> None:
+    def on_sample_end(self, *, samples, **kwargs) -> None:
         """Обработка окончания семплирования"""
         
         try:
@@ -369,7 +369,7 @@ class FixedLeagueCallbacksWithONNXAndRecording(RLlibCallback):
                         
                         if total_invalid_target > 0 or total_oob_move > 0 or total_oob_aim > 0:
                             if self.writer:
-                                it = algorithm.iteration if hasattr(algorithm, 'iteration') else 0
+                                it = getattr(samples, 'iteration', 0) if hasattr(samples, 'iteration') else 0
                                 self.writer.add_scalar("validation/invalid_targets", total_invalid_target, it)
                                 self.writer.add_scalar("validation/oob_moves", total_oob_move, it)
                                 self.writer.add_scalar("validation/oob_aims", total_oob_aim, it)
@@ -513,7 +513,7 @@ def test_onnx_export_standalone():
             print(f"✅ ONNX export test PASSED! Exported {len(successful_exports)} policies")
             
             # Тестируем инференс
-            from infer_onnx import run_inference_test
+            from onnx_callbacks import run_inference_test
             
             for export in successful_exports:
                 onnx_path = export["onnx_path"]

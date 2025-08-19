@@ -1,6 +1,6 @@
 """
 Система записи данных боев для последующей визуализации
-Интегрируется с тренировкой и записывает траектории, действия, команды
+ИСПРАВЛЕНИЕ: Правильная сериализация в JSON (bool -> int)
 """
 
 import json
@@ -122,9 +122,9 @@ class BattleRecorder:
                     hp=float(hp),
                     alive=hp > 0,
                     target_enemy=int(target_enemy),
-                    move_action=list(move_action),
-                    aim_action=list(aim_action),
-                    fire_action=fire_action,
+                    move_action=[float(x) for x in move_action],
+                    aim_action=[float(x) for x in aim_action],
+                    fire_action=bool(fire_action),
                     command_type=command_type,
                     command_target=command_target,
                     command_priority=command_priority
@@ -137,8 +137,8 @@ class BattleRecorder:
                     self.current_frame_events.append({
                         "type": "fire",
                         "shooter": agent_id,
-                        "target_index": target_enemy,
-                        "timestamp": time.time()
+                        "target_index": int(target_enemy),
+                        "timestamp": float(time.time())
                     })
                 
                 # Проверяем смерть (HP упало до 0 в этом кадре)
@@ -150,13 +150,13 @@ class BattleRecorder:
                         self.current_frame_events.append({
                             "type": "death",
                             "robot": agent_id,
-                            "timestamp": time.time()
+                            "timestamp": float(time.time())
                         })
         
         # Создаем кадр
         frame = BattleFrame(
-            timestamp=time.time(),
-            step=self.frame_counter,
+            timestamp=float(time.time()),
+            step=int(self.frame_counter),
             robots=robots,
             global_state=global_state or {},
             events=self.current_frame_events.copy()
@@ -204,8 +204,8 @@ class BattleRecorder:
             "total_shots": 0,
             "total_deaths": 0,
             "team_stats": {"red": {}, "blue": {}},
-            "average_distance": 0,
-            "action_distribution": defaultdict(int)
+            "average_distance": 0.0,
+            "action_distribution": {}
         }
         
         # Подсчитываем события
@@ -223,9 +223,9 @@ class BattleRecorder:
             total_hp = sum(r.hp for r in team_robots if r.alive)
             
             stats["team_stats"][team] = {
-                "alive_count": alive_count,
-                "total_hp": total_hp,
-                "initial_count": self.current_battle.red_team_size if team == "red" else self.current_battle.blue_team_size
+                "alive_count": int(alive_count),
+                "total_hp": float(total_hp),
+                "initial_count": int(self.current_battle.red_team_size if team == "red" else self.current_battle.blue_team_size)
             }
         
         # Средняя дистанция между командами
@@ -245,6 +245,25 @@ class BattleRecorder:
         
         self.current_battle.final_stats.update(stats)
     
+    def _convert_for_json(self, obj):
+        """Конвертирует объект для JSON сериализации"""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, bool):
+            return obj
+        elif isinstance(obj, dict):
+            return {key: self._convert_for_json(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_for_json(item) for item in obj]
+        else:
+            return obj
+    
     def _save_battle(self):
         """Сохраняет запись боя в JSON файл"""
         if not self.current_battle:
@@ -253,13 +272,22 @@ class BattleRecorder:
         filename = f"battle_{self.current_battle.battle_id}_{int(self.current_battle.start_time)}.json"
         filepath = os.path.join(self.output_dir, filename)
         
-        # Конвертируем в словарь для JSON
-        battle_dict = asdict(self.current_battle)
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(battle_dict, f, ensure_ascii=False, indent=2)
-        
-        print(f"💾 Saved battle recording: {filepath}")
+        try:
+            # Конвертируем в словарь для JSON
+            battle_dict = asdict(self.current_battle)
+            
+            # ИСПРАВЛЕНИЕ: Конвертируем все для JSON совместимости
+            battle_dict_clean = self._convert_for_json(battle_dict)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(battle_dict_clean, f, ensure_ascii=False, indent=2)
+            
+            print(f"💾 Saved battle recording: {filepath}")
+            
+        except Exception as e:
+            print(f"❌ Error saving battle: {e}")
+            import traceback
+            traceback.print_exc()
     
     def export_for_web_visualizer(self, battle_files: Optional[List[str]] = None) -> str:
         """Экспортирует данные для веб-визуализатора"""
@@ -279,8 +307,12 @@ class BattleRecorder:
         latest_file = max(battle_files, key=lambda f: os.path.getmtime(os.path.join(self.output_dir, f)))
         filepath = os.path.join(self.output_dir, latest_file)
         
-        with open(filepath, 'r', encoding='utf-8') as f:
-            battle_data = json.load(f)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                battle_data = json.load(f)
+        except Exception as e:
+            print(f"Error loading battle file {filepath}: {e}")
+            return ""
         
         # Конвертируем в формат для веб-визуализатора
         web_data = {
@@ -328,14 +360,18 @@ class BattleRecorder:
         
         # Сохраняем в формате для веб-визуализатора
         web_export_path = os.path.join(self.output_dir, "latest_battle_web.json")
-        with open(web_export_path, 'w', encoding='utf-8') as f:
-            json.dump(web_data, f, ensure_ascii=False, indent=2)
-        
-        print(f"🌐 Exported for web visualizer: {web_export_path}")
-        
-        # Также создаем HTML файл с встроенными данными
-        html_path = self._create_standalone_html(web_data)
-        return html_path
+        try:
+            with open(web_export_path, 'w', encoding='utf-8') as f:
+                json.dump(web_data, f, ensure_ascii=False, indent=2)
+            
+            print(f"🌐 Exported for web visualizer: {web_export_path}")
+            
+            # Также создаем HTML файл с встроенными данными
+            html_path = self._create_standalone_html(web_data)
+            return html_path
+        except Exception as e:
+            print(f"Error exporting web visualizer: {e}")
+            return ""
     
     def _create_standalone_html(self, battle_data: Dict) -> str:
         """Создает автономный HTML файл с данными боя"""
@@ -503,11 +539,15 @@ class BattleRecorder:
         )
         
         html_path = os.path.join(self.output_dir, f"replay_{battle_data['battle_info']['id']}.html")
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(html_template)
-        
-        print(f"🎬 Created battle replay: {html_path}")
-        return html_path
+        try:
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_template)
+            
+            print(f"🎬 Created battle replay: {html_path}")
+            return html_path
+        except Exception as e:
+            print(f"Error creating HTML: {e}")
+            return ""
     
     def get_summary_statistics(self) -> Dict[str, Any]:
         """Возвращает сводную статистику всех записанных боев"""
@@ -545,15 +585,20 @@ class RecordingArenaWrapper:
     def reset(self, **kwargs):
         # Завершаем предыдущий бой если был
         if self.recorder.current_battle is not None:
-            # Определяем победителя по HP
-            red_agents = [aid for aid in self.current_observations.keys() if aid.startswith("red_")]
-            blue_agents = [aid for aid in self.current_observations.keys() if aid.startswith("blue_")]
-            
-            red_hp = sum(self.env._hp.get(aid, 0) for aid in red_agents if self.env._is_alive(aid))
-            blue_hp = sum(self.env._hp.get(aid, 0) for aid in blue_agents if self.env._is_alive(aid))
-            
-            winner = "red" if red_hp > blue_hp else "blue" if blue_hp > red_hp else "draw"
-            self.recorder.end_battle(winner)
+            try:
+                # Определяем победителя по HP
+                red_agents = [aid for aid in self.current_observations.keys() if aid.startswith("red_")]
+                blue_agents = [aid for aid in self.current_observations.keys() if aid.startswith("blue_")]
+                
+                red_hp = sum(self.env._hp.get(aid, 0) for aid in red_agents if self.env._is_alive(aid))
+                blue_hp = sum(self.env._hp.get(aid, 0) for aid in blue_agents if self.env._is_alive(aid))
+                
+                winner = "red" if red_hp > blue_hp else "blue" if blue_hp > red_hp else "draw"
+                self.recorder.end_battle(winner)
+            except Exception as e:
+                print(f"Error ending battle: {e}")
+                # Завершаем бой принудительно
+                self.recorder.current_battle = None
         
         # Начинаем новый бой
         obs, info = self.env.reset(**kwargs)
@@ -576,17 +621,20 @@ class RecordingArenaWrapper:
         obs, rewards, terms, truncs, infos = self.env.step(action_dict)
         
         # Записываем кадр
-        self.recorder.record_frame(
-            observations=self.current_observations,
-            actions=self.current_actions,
-            rewards=rewards,
-            infos=infos,
-            global_state={
-                "timestep": getattr(self.env, '_t', 0),
-                "red_hp": sum(self.env._hp.get(aid, 0) for aid in self.env._agents_red),
-                "blue_hp": sum(self.env._hp.get(aid, 0) for aid in self.env._agents_blue),
-            }
-        )
+        try:
+            self.recorder.record_frame(
+                observations=self.current_observations,
+                actions=self.current_actions,
+                rewards=rewards,
+                infos=infos,
+                global_state={
+                    "timestep": getattr(self.env, '_t', 0),
+                    "red_hp": sum(self.env._hp.get(aid, 0) for aid in self.env._agents_red),
+                    "blue_hp": sum(self.env._hp.get(aid, 0) for aid in self.env._agents_blue),
+                }
+            )
+        except Exception as e:
+            print(f"Error recording frame: {e}")
         
         self.current_observations = obs
         return obs, rewards, terms, truncs, infos
