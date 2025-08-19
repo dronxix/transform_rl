@@ -1,6 +1,6 @@
 """
 Чистый скрипт тренировки Arena Multi-Agent системы
-Простой, понятный код без излишних усложнений
+ИСПРАВЛЕНИЕ: Добавлена обработка final_checkpoint и правильная работа с Ray 2.48
 """
 
 import os
@@ -159,29 +159,33 @@ def main():
             )
         )
         
-        # Создание callbacks
-        def create_callbacks():
-            callbacks = FixedLeagueCallbacksWithONNXAndRecording()
-            callbacks.setup(
-                league_actor=league,
-                opponent_ids=opponent_ids,
-                eval_episodes=2 if args.test else 4,
-                clone_every_iters=3 if args.test else 15,
-                export_onnx=True,
-                export_every=export_every,
-                export_dir="./onnx_exports",
-                policies_to_export=["main"],
-                record_battles=True,
-                recording_frequency=1 if args.test else 5,
-                recordings_dir="./battle_recordings",
-            )
-            return callbacks
+        # ИСПРАВЛЕНИЕ: Создание callbacks БЕЗ использования метода .callbacks()
+        # Это решает проблему с worker processes
+        callbacks = FixedLeagueCallbacksWithONNXAndRecording()
+        callbacks.setup(
+            league_actor=league,
+            opponent_ids=opponent_ids,
+            eval_episodes=2 if args.test else 4,
+            clone_every_iters=3 if args.test else 15,
+            export_onnx=True,
+            export_every=export_every,
+            export_dir="./onnx_exports",
+            policies_to_export=["main"],
+            record_battles=True,
+            recording_frequency=1 if args.test else 5,
+            recordings_dir="./battle_recordings",
+        )
         
-        config = config.callbacks(create_callbacks)
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Правильная установка callbacks для Ray 2.48
+        # Метод .callbacks() не работает корректно с worker processes
+        config.callbacks_class = FixedLeagueCallbacksWithONNXAndRecording
         
         # Построение алгоритма
         print("🔧 Building algorithm...")
         algo = config.build()
+        
+        # ИСПРАВЛЕНИЕ: Устанавливаем callbacks ПОСЛЕ создания алгоритма
+        algo.callbacks = callbacks
         
         # Инициализация весов оппонентов
         main_weights = algo.get_policy("main").get_weights()
@@ -192,6 +196,7 @@ def main():
         
         # Цикл тренировки
         best_reward = float('-inf')
+        final_checkpoint = None
         
         for i in range(iterations):
             try:
@@ -221,9 +226,18 @@ def main():
                 # Сохранение чекпоинтов
                 checkpoint_freq = 3 if args.test else 50
                 if i % checkpoint_freq == 0 and i > 0:
-                    checkpoint = algo.save()
-                    print(f"💾 Checkpoint: {os.path.basename(checkpoint)}")
+                    checkpoint_result = algo.save()
+                    # ИСПРАВЛЕНИЕ: Правильная обработка результата save()
+                    if hasattr(checkpoint_result, 'checkpoint'):
+                        checkpoint_path = checkpoint_result.checkpoint
+                    elif isinstance(checkpoint_result, str):
+                        checkpoint_path = checkpoint_result
+                    else:
+                        checkpoint_path = str(checkpoint_result)
+                    
+                    print(f"💾 Checkpoint: {os.path.basename(checkpoint_path)}")
                     print(f"   Best reward: {best_reward:.3f}")
+                    final_checkpoint = checkpoint_path
                 
             except KeyboardInterrupt:
                 print("\n⏹️ Training interrupted")
@@ -235,7 +249,16 @@ def main():
                 continue
         
         # Финальное сохранение
-        final_checkpoint = algo.save()
+        if final_checkpoint is None:
+            checkpoint_result = algo.save()
+            # ИСПРАВЛЕНИЕ: Правильная обработка результата save()
+            if hasattr(checkpoint_result, 'checkpoint'):
+                final_checkpoint = checkpoint_result.checkpoint
+            elif isinstance(checkpoint_result, str):
+                final_checkpoint = checkpoint_result
+            else:
+                final_checkpoint = str(checkpoint_result)
+        
         print(f"\n🏁 Training completed!")
         print(f"   Final checkpoint: {os.path.basename(final_checkpoint)}")
         print(f"   Best reward: {best_reward:.3f}")
@@ -259,15 +282,18 @@ def main():
         # Показываем созданные файлы
         print(f"\n📁 Generated files:")
         if os.path.exists("./onnx_exports"):
-            onnx_count = len([f for f in os.listdir("./onnx_exports") if f.endswith('.onnx')])
-            if onnx_count > 0:
-                print(f"   ONNX models: ./onnx_exports/ ({onnx_count} files)")
+            onnx_files = []
+            for root, dirs, files in os.walk("./onnx_exports"):
+                onnx_files.extend([f for f in files if f.endswith('.onnx')])
+            if onnx_files:
+                print(f"   ONNX models: ./onnx_exports/ ({len(onnx_files)} files)")
         
         if os.path.exists("./battle_recordings"):
-            recording_count = len([f for f in os.listdir("./battle_recordings") 
-                                 if f.endswith(('.json', '.html'))])
-            if recording_count > 0:
-                print(f"   Battle recordings: ./battle_recordings/ ({recording_count} files)")
+            recording_files = []
+            for root, dirs, files in os.walk("./battle_recordings"):
+                recording_files.extend([f for f in files if f.endswith(('.json', '.html'))])
+            if recording_files:
+                print(f"   Battle recordings: ./battle_recordings/ ({len(recording_files)} files)")
         
         print(f"   Checkpoints: {os.path.dirname(final_checkpoint)}")
         
@@ -332,19 +358,19 @@ if __name__ == "__main__":
 🎮 Arena Training Examples:
 
 1. Quick test (5 iterations):
-   python train_clean.py --test
+   python train.py --test
 
 2. Basic training:
-   python train_clean.py --iterations 100
+   python train.py --iterations 100
 
 3. GSPO algorithm:
-   python train_clean.py --algo gspo --iterations 500
+   python train.py --algo gspo --iterations 500
 
 4. GRPO algorithm:
-   python train_clean.py --algo grpo --iterations 300
+   python train.py --algo grpo --iterations 300
 
 5. System check:
-   python train_clean.py --quick-test
+   python train.py --quick-test
 
 📁 Output locations:
    - Checkpoints: ./rllib_league_results/
