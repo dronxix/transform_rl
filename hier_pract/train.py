@@ -1,9 +1,10 @@
 """
-Обновленный главный скрипт тренировки с всеми исправлениями:
-1. Исправленный ONNX экспорт с meta.json файлами
-2. Запись и визуализация боев
-3. Иерархическая система команд (опционально)
-4. Улучшенная обработка ошибок
+Обновленный главный скрипт тренировки с исправлениями для Ray 2.4.8:
+1. Правильные сигнатуры callbacks
+2. Исправленный ONNX экспорт с meta.json файлами
+3. Запись и визуализация боев
+4. Иерархическая система команд (опционально)
+5. Улучшенная обработка ошибок
 """
 
 import os
@@ -35,6 +36,473 @@ except ImportError:
     print("⚠️ Hierarchical command system not available")
 
 def env_creator(cfg): 
+    return ArenaEnv(cfg)
+
+def check_ray_compatibility():
+    """Проверяет совместимость версии Ray"""
+    
+    try:
+        import ray
+        version = ray.__version__
+        print(f"🔍 Ray version: {version}")
+        
+        # Проверяем что версия подходящая
+        version_parts = version.split('.')
+        major, minor = int(version_parts[0]), int(version_parts[1])
+        
+        if major < 2:
+            print(f"⚠️ Ray version {version} is quite old, recommend 2.4+")
+            return False
+        elif major == 2 and minor < 4:
+            print(f"⚠️ Ray version {version} may have compatibility issues, recommend 2.4+")
+            return True  # Может работать, но с предупреждением
+        else:
+            print(f"✅ Ray version {version} is compatible")
+            return True
+            
+    except Exception as e:
+        print(f"❌ Ray compatibility check failed: {e}")
+        return False
+
+def parse_arguments():
+    """Парсинг аргументов командной строки"""
+    parser = argparse.ArgumentParser(description="Advanced Arena Training with ONNX Export and Battle Recording")
+    
+    # Основные параметры тренировки
+    parser.add_argument("--iterations", type=int, default=1000, help="Number of training iterations")
+    parser.add_argument("--algo", choices=["ppo", "gspo", "grpo"], default="gspo", help="Algorithm variant")
+    parser.add_argument("--hierarchical", action="store_true", help="Use hierarchical command system")
+    
+    # Параметры окружения
+    parser.add_argument("--max-allies", type=int, default=6, help="Maximum allies")
+    parser.add_argument("--max-enemies", type=int, default=6, help="Maximum enemies")
+    parser.add_argument("--episode-len", type=int, default=128, help="Episode length")
+    
+    # Параметры league
+    parser.add_argument("--opponents", type=int, default=6, help="Number of opponent policies")
+    parser.add_argument("--eval-episodes", type=int, default=4, help="Episodes per evaluation")
+    parser.add_argument("--clone-every", type=int, default=15, help="Clone opponent every N iterations")
+    
+    # ONNX экспорт
+    parser.add_argument("--export-onnx", action="store_true", default=True, help="Enable ONNX export")
+    parser.add_argument("--export-every", type=int, default=25, help="Export ONNX every N iterations")
+    parser.add_argument("--export-dir", type=str, default="./onnx_exports", help="ONNX export directory")
+    
+    # Запись боев
+    parser.add_argument("--record-battles", action="store_true", default=True, help="Record battles for visualization")
+    parser.add_argument("--recording-freq", type=int, default=5, help="Record every N-th evaluation match")
+    parser.add_argument("--recordings-dir", type=str, default="./battle_recordings", help="Battle recordings directory")
+    
+    # Производительность
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of env runners")
+    parser.add_argument("--train-batch-size", type=int, default=16384, help="Training batch size")
+    parser.add_argument("--minibatch-size", type=int, default=2048, help="Minibatch size")
+    
+    # Логирование
+    parser.add_argument("--log-dir", type=str, default="./logs", help="Logging directory")
+    parser.add_argument("--checkpoint-freq", type=int, default=50, help="Checkpoint frequency")
+    
+    # Режимы
+    parser.add_argument("--test", action="store_true", help="Run quick test mode")
+    parser.add_argument("--check-compatibility", action="store_true", help="Check Ray compatibility")
+    
+    return parser.parse_args()
+
+def setup_models_and_env(args):
+    """Регистрация моделей и окружений"""
+    
+    register_env("ArenaEnv", env_creator)
+    ModelCatalog.register_custom_model("entity_attention", ONNXEntityAttentionModel)
+    ModelCatalog.register_custom_action_dist("masked_multihead", MaskedTargetMoveAimFire)
+    
+    # Регистрируем иерархические модели если доступны
+    if args.hierarchical and HIERARCHICAL_AVAILABLE:
+        ModelCatalog.register_custom_model("commander", CommanderModel)
+        ModelCatalog.register_custom_model("follower", CommandFollowerModel)
+        ModelCatalog.register_custom_action_dist("command_dist", CommandDistribution)
+        print("✅ Hierarchical models registered")
+    elif args.hierarchical:
+        print("❌ Hierarchical system requested but not available, falling back to standard")
+        args.hierarchical = False
+
+def create_algorithm_config(args, obs_space, act_space, max_enemies, max_allies, opponent_ids):
+    """Создание конфигурации алгоритма"""
+    
+    # Выбор класса политики
+    if args.algo == "gspo":
+        policy_cls = GSPOTorchPolicy
+        print("🎯 Using GSPO (Group Advantage)")
+    elif args.algo == "grpo":
+        policy_cls = GRPOTorchPolicy
+        print("🎯 Using GRPO (Group Return)")
+    else:
+        policy_cls = None
+        print("🎯 Using standard PPO")
+    
+    # Базовая конфигурация модели
+    base_model_config = {
+        "custom_model": "entity_attention",
+        "custom_action_dist": "masked_multihead",
+        "custom_model_config": {
+            "d_model": 128,
+            "nhead": 8,
+            "layers": 2,
+            "ff": 256,
+            "hidden": 256,
+            "max_enemies": max_enemies,
+            "max_allies": max_allies,
+        },
+        "vf_share_layers": False,
+    }
+    
+    # Policy mapping function
+    if args.hierarchical:
+        def policy_mapping_fn(agent_id: str, episode=None, **kwargs):
+            if agent_id == "commander":
+                return "commander_policy"
+            elif agent_id.startswith("red_"):
+                return "follower_policy" 
+            else:
+                # Простая ротация оппонентов
+                import hashlib
+                hash_val = int(hashlib.md5(str(episode).encode()).hexdigest()[:8], 16)
+                return opponent_ids[hash_val % len(opponent_ids)]
+    else:
+        def policy_mapping_fn(agent_id: str, episode=None, **kwargs):
+            if agent_id.startswith("red_"):
+                return "main"
+            else:
+                # Простая ротация оппонентов
+                import hashlib
+                hash_val = int(hashlib.md5(str(episode).encode()).hexdigest()[:8], 16)
+                return opponent_ids[hash_val % len(opponent_ids)]
+    
+    # Создание политик
+    if args.hierarchical:
+        from gymnasium import spaces
+        import numpy as np
+        
+        # Расширенное observation space для follower (включает команды)
+        follower_obs_space = spaces.Dict({
+            **obs_space.spaces,
+            "command": spaces.Box(low=0, high=1, shape=(10,), dtype=np.float32)
+        })
+        
+        policies = {
+            "commander_policy": (None, obs_space, None, {
+                "model": {
+                    "custom_model": "commander",
+                    "custom_action_dist": "command_dist",
+                    "custom_model_config": base_model_config["custom_model_config"].copy(),
+                    "vf_share_layers": False,
+                }
+            }),
+            "follower_policy": (policy_cls, follower_obs_space, act_space, {
+                "model": {
+                    "custom_model": "follower",
+                    "custom_action_dist": "masked_multihead",
+                    "custom_model_config": base_model_config["custom_model_config"].copy(),
+                    "vf_share_layers": False,
+                }
+            }),
+            **{
+                pid: (None, obs_space, act_space, {
+                    "model": base_model_config.copy()
+                }) for pid in opponent_ids
+            }
+        }
+        
+        policies_to_train = ["commander_policy", "follower_policy"]
+        
+    else:
+        policies = {
+            "main": (policy_cls, obs_space, act_space, {
+                "model": base_model_config.copy()
+            }),
+            **{
+                pid: (None, obs_space, act_space, {
+                    "model": base_model_config.copy()
+                }) for pid in opponent_ids
+            }
+        }
+        
+        policies_to_train = ["main"]
+    
+    # Создание конфигурации
+    config = (
+        PPOConfig()
+        .api_stack(
+            enable_rl_module_and_learner=False,
+            enable_env_runner_and_connector_v2=False,
+        )
+        .environment(
+            env="ArenaEnv",
+            env_config={
+                "episode_len": args.episode_len,
+                "ally_choices": [1],
+                "enemy_choices": [1],
+                "max_allies": args.max_allies,
+                "max_enemies": args.max_enemies,
+                "assert_invalid_actions": True,
+                "hierarchical": args.hierarchical,
+            }
+        )
+        .framework("torch")
+        .env_runners(
+            num_env_runners=args.num_workers,
+            num_envs_per_env_runner=1,
+            rollout_fragment_length=256,
+            batch_mode="truncate_episodes",
+        )
+        .resources(
+            num_gpus=1 if torch.cuda.is_available() else 0,
+            num_cpus_for_main_process=1,
+        )
+        .training(
+            gamma=0.99,
+            lr=3e-4,
+            train_batch_size=args.train_batch_size,
+            minibatch_size=args.minibatch_size,
+            num_epochs=4,
+            use_gae=True,
+            lambda_=0.95,
+            clip_param=0.15,
+            vf_clip_param=10.0,
+            entropy_coeff=0.003,
+        )
+        .multi_agent(
+            policies=policies,
+            policy_mapping_fn=policy_mapping_fn,
+            policies_to_train=policies_to_train,
+            count_steps_by="agent_steps",
+        )
+        .fault_tolerance(
+            restart_failed_env_runners=True,
+        )
+    )
+    
+    return config
+
+def create_callbacks(args, league, opponent_ids):
+    """Создание callbacks с настройками"""
+    
+    def create_callbacks_fn():
+        callbacks = FixedLeagueCallbacksWithONNXAndRecording()
+        callbacks.setup(
+            league_actor=league,
+            opponent_ids=opponent_ids,
+            eval_episodes=args.eval_episodes,
+            clone_every_iters=args.clone_every,
+            curriculum_schedule=[
+                (0, [1], [1]),
+                (2_000_000, [1, 2], [1, 2]),
+                (8_000_000, [1, 2, 3], [1, 2, 3]),
+            ],            
+            # ONNX экспорт
+            export_onnx=args.export_onnx,
+            export_every=args.export_every,
+            export_dir=args.export_dir,
+            policies_to_export=["main"] if not args.hierarchical else ["commander_policy", "follower_policy"],
+            
+            # Запись боев
+            record_battles=args.record_battles,
+            recording_frequency=args.recording_freq,
+            recordings_dir=args.recordings_dir,
+        )
+        return callbacks
+    
+    return create_callbacks_fn
+
+def main():
+    """Основная функция"""
+    
+    # Парсинг аргументов
+    args = parse_arguments()
+    
+    # Проверка совместимости если запрошена
+    if args.check_compatibility:
+        if check_ray_compatibility():
+            print("✅ Ray compatibility check passed")
+        else:
+            print("❌ Ray compatibility issues detected")
+        return 0
+    
+    print("🚀 Starting Advanced Arena Training")
+    print(f"   Algorithm: {args.algo.upper()}")
+    print(f"   Hierarchical: {args.hierarchical}")
+    print(f"   ONNX Export: {args.export_onnx}")
+    print(f"   Battle Recording: {args.record_battles}")
+    print(f"   Iterations: {args.iterations}")
+    
+    # Проверка совместимости Ray
+    if not check_ray_compatibility():
+        print("⚠️ Ray compatibility warning - continuing anyway")
+    
+    # Создание директорий
+    os.makedirs(args.log_dir, exist_ok=True)
+    if args.export_onnx:
+        os.makedirs(args.export_dir, exist_ok=True)
+    if args.record_battles:
+        os.makedirs(args.recordings_dir, exist_ok=True)
+    
+    # Инициализация Ray
+    ray.init(ignore_reinit_error=True)
+    
+    try:
+        # Настройка моделей и окружений
+        setup_models_and_env(args)
+        
+        # Создание League State
+        opponent_ids = [f"opponent_{i}" for i in range(args.opponents)]
+        league = LeagueState.remote(opponent_ids)
+        
+        # Получение размеров окружения
+        tmp_env = ArenaEnv({"ally_choices": [1], "enemy_choices": [1]})
+        obs_space = tmp_env.observation_space
+        act_space = tmp_env.action_space
+        max_enemies = obs_space["enemies"].shape[0]
+        max_allies = obs_space["allies"].shape[0]
+        
+        print(f"🏟️ Arena setup: {max_allies} allies vs {max_enemies} enemies")
+        
+        # Создание конфигурации алгоритма
+        config = create_algorithm_config(args, obs_space, act_space, max_enemies, max_allies, opponent_ids)
+        
+        # Добавление callbacks
+        callbacks_fn = create_callbacks(args, league, opponent_ids)
+        config = config.callbacks(callbacks_fn)
+        
+        # Построение алгоритма
+        print("🔧 Building algorithm...")
+        algo = config.build()
+        
+        # Инициализация весов оппонентов
+        if args.hierarchical:
+            # Для иерархической системы инициализируем отдельно
+            commander_weights = algo.get_policy("commander_policy").get_weights()
+            follower_weights = algo.get_policy("follower_policy").get_weights()
+            
+            for pid in opponent_ids:
+                # Оппоненты используют стандартную модель
+                algo.get_policy(pid).set_weights(follower_weights)
+        else:
+            main_weights = algo.get_policy("main").get_weights()
+            for pid in opponent_ids:
+                algo.get_policy(pid).set_weights(main_weights)
+        
+        print("✅ Algorithm built and initialized")
+        
+        # Основной цикл тренировки
+        print(f"🎮 Starting training for {args.iterations} iterations...")
+        
+        best_reward = float('-inf')
+        
+        for i in range(args.iterations):
+            try:
+                result = algo.train()
+                
+                # Получение метрик
+                env_runners_metrics = result.get("env_runners", {})
+                episode_reward_mean = env_runners_metrics.get("episode_reward_mean", 0)
+                timesteps_total = result.get("timesteps_total", 0)
+                
+                # Логирование прогресса
+                if i % 10 == 0:
+                    print(f"[{i:4d}] Reward: {episode_reward_mean:.3f}, Timesteps: {timesteps_total:,}")
+                    
+                    # Дополнительные метрики
+                    custom_metrics = result.get("custom_metrics", {})
+                    if custom_metrics:
+                        league_metrics = [(k, v) for k, v in custom_metrics.items() if k.startswith("ts_")]
+                        if league_metrics:
+                            print(f"       League: {dict(league_metrics[:3])}")  # Показываем первые 3
+                
+                # Сохранение лучшей модели
+                if episode_reward_mean > best_reward:
+                    best_reward = episode_reward_mean
+                    
+                # Сохранение чекпоинтов
+                if i % args.checkpoint_freq == 0 and i > 0:
+                    checkpoint = algo.save()
+                    print(f"💾 Checkpoint saved: {checkpoint}")
+                    
+                    # Дополнительная информация в логах
+                    print(f"    Best reward so far: {best_reward:.3f}")
+                    
+                    # Статистика league если доступна
+                    try:
+                        scores = ray.get(league.get_all_scores.remote())
+                        main_score = scores.get("main", (0, 0))
+                        print(f"    Main policy TrueSkill: μ={main_score[0]:.3f}, σ={main_score[1]:.3f}")
+                    except:
+                        pass
+                
+            except KeyboardInterrupt:
+                print("\n⏹️ Training interrupted by user")
+                break
+            except Exception as e:
+                print(f"❌ Training error at iteration {i}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Продолжаем если ошибка не критична
+                continue
+        
+        # Финальное сохранение
+        final_checkpoint = algo.save()
+        print(f"🏁 Final checkpoint saved: {final_checkpoint}")
+        
+        # Финальная статистика
+        print(f"\n📊 Training Summary:")
+        print(f"   Total iterations: {i + 1}")
+        print(f"   Best reward: {best_reward:.3f}")
+        print(f"   Final timesteps: {timesteps_total:,}")
+        
+        # Статистика League
+        try:
+            scores = ray.get(league.get_all_scores.remote())
+            print(f"\n🏆 Final League Standings:")
+            for policy_id, (mu, sigma) in scores.items():
+                conservative_score = mu - 3 * sigma
+                print(f"   {policy_id}: μ={mu:.3f}, σ={sigma:.3f}, conservative={conservative_score:.3f}")
+        except Exception as e:
+            print(f"   Could not retrieve league scores: {e}")
+        
+        # Экспорт финальных моделей
+        if args.export_onnx:
+            try:
+                print(f"\n🔧 Exporting final ONNX models...")
+                from fixed_onnx_export import export_onnx_with_meta
+                
+                policies_to_export = ["main"] if not args.hierarchical else ["commander_policy", "follower_policy"]
+                successful_exports = export_onnx_with_meta(
+                    algorithm=algo,
+                    iteration=i + 1,
+                    export_dir=args.export_dir,
+                    policies_to_export=policies_to_export
+                )
+                
+                if successful_exports:
+                    print(f"✅ Exported {len(successful_exports)} final models")
+                    for export in successful_exports:
+                        print(f"   {export['policy_id']}: {export['onnx_path']}")
+                else:
+                    print("⚠️ No final models were exported")
+                    
+            except Exception as e:
+                print(f"❌ Final ONNX export failed: {e}")
+        
+        # Экспорт финальных записей боев
+        if args.record_battles:
+            try:
+                print(f"\n🎬 Exporting final battle recordings...")
+                
+                # Проверяем есть ли записи у callbacks
+                callback_instance = algo.callbacks._callbacks[0] if hasattr(algo, 'callbacks') and algo.callbacks._callbacks else None
+                if callback_instance and hasattr(callback_instance, 'battle_recorder') and callback_instance.battle_recorder:
+                    recorder = callback_instance.battle_recorder
+                    
+                    # Экспорdef env_creator(cfg): 
     return ArenaEnv(cfg)
 
 def parse_arguments():
