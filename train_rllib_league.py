@@ -13,9 +13,7 @@ from arena_env import ArenaEnv
 from entity_attention_model import ONNXEntityAttentionModel 
 from masked_multihead_dist import MaskedTargetMoveAimFire 
 from league_state import LeagueState
-from selfplay_league_callbacks import LeagueCallbacks
 from onnx_callbacks import LeagueCallbacksWithONNX
-from simple_onnx import FinalONNXCallbacks
 from gspo_grpo_policy import GSPOTorchPolicy, GRPOTorchPolicy
 import torch
 
@@ -142,22 +140,6 @@ def main():
             restart_failed_env_runners=True,  # RAY 2.48: новый параметр
         )
     )
-
-    def create_callbacks():
-        """Фабрика для создания callbacks с правильными параметрами"""
-        callbacks = LeagueCallbacks()
-        callbacks.setup(
-            league_actor=league,
-            opponent_ids=opponent_ids,
-            eval_episodes=4,
-            clone_every_iters=15,
-            curriculum_schedule=[
-                (0, [1], [1]),
-                (2_000_000, [1, 2], [1, 2]),
-                (8_000_000, [1, 2, 3], [1, 2, 3]),
-            ]
-        )
-        return callbacks
     
     def create_callbacks_onnx():
         """Фабрика для создания callbacks с правильными параметрами"""
@@ -180,53 +162,10 @@ def main():
             
         )
         return callbacks
-    
-    def create_callbacks_onnx_simp():
-        """Создание упрощенных callbacks только для ONNX экспорта"""
-        callbacks = FinalONNXCallbacks()
-        callbacks.setup(
-            export_onnx=True,
-            export_every=1,  # Экспорт каждые 5 итераций для тестирования
-            export_dir="./onnx_exports",
-            policies_to_export=["main"]
-        )
-        return callbacks
 
     # Передаем функцию, а не объект
-    # config = config.callbacks(create_callbacks)
     config = config.callbacks(create_callbacks_onnx)
-    # config = config.callbacks(create_callbacks_onnx_simp)
 
-    # ИЛИ альтернативный способ - через лямбду:
-    # config = config.callbacks(lambda: LeagueCallbacks().setup(
-    #     league_actor=league,
-    #     opponent_ids=opponent_ids,
-    #     eval_episodes=4,
-    #     clone_every_iters=15,
-    #     curriculum_schedule=[(0, [1], [1]), (2_000_000, [1, 2], [1, 2])]
-    # ))
-
-    # # ИЛИ самый простой способ - через класс:
-    # class ConfiguredLeagueCallbacks(LeagueCallbacks):
-    #     def __init__(self):
-    #         super().__init__()
-    #         # Здесь сразу настраиваем параметры
-    #         self.league = None  # Будет установлено позже
-    #         self.opponent_ids = [f"opponent_{i}" for i in range(6)]
-    #         self.eval_eps = 4
-    #         self.clone_every = 15
-    #         self.curriculum = [
-    #             (0, [1], [1]),
-    #             (2_000_000, [1, 2], [1, 2]),
-    #             (8_000_000, [1, 2, 3], [1, 2, 3]),
-    #         ]
-        
-    #     def set_league(self, league_actor):
-    #         self.league = league_actor
-
-    # Используем класс напрямую
-    # config = config.callbacks(ConfiguredLeagueCallbacks)
-    
     # Построение алгоритма
     algo = config.build()
     
