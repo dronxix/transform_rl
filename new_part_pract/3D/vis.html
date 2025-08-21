@@ -1,8 +1,9 @@
+<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Arena 3D Визуализатор Боев</title>
+  <title>Arena 3D Battle Visualizer</title>
   <style>
     :root{
       --bg:#0b0f1a;--bg2:#0e1424;--panel:#121b30;--panel2:#0f1a33;
@@ -28,8 +29,7 @@
     .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
     .btn{
       background:#1a2644;border:1px solid var(--border);color:var(--text);
-      padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600;
-      border:none;outline:none;
+      padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600
     }
     .btn:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.25)}
     .btn.primary{background:linear-gradient(135deg,#1f8a81,#2563eb);border-color:#2563eb}
@@ -42,19 +42,14 @@
     .speed{display:flex;align-items:center;gap:8px}
     .layout{display:flex;flex:1 1 auto;min-height:0}
     .viewer{position:relative;flex:1 1 auto;min-width:0}
-    #threejs-container{position:absolute;inset:0}
-    .loading{
-      position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-      text-align:center;background:rgba(0,0,0,0.8);padding:20px;border-radius:10px;
+    #threejs-container{position:absolute;inset:0;z-index:1}
+    /* важно: канвас не перехватывается оверлеями и принимает жесты */
+    .overlay-hint{
+      position:absolute;left:50%;top:16px;transform:translateX(-50%);
+      background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px;
+      pointer-events:none; /* ключ, чтобы не ломать управление камерой */
     }
-    .loading .spinner{
-      border:3px solid #334155;border-top:3px solid #3b82f6;border-radius:50%;
-      width:40px;height:40px;animation:spin 1s linear infinite;margin:0 auto 10px;
-    }
-    @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
-    .overlay-hint{position:absolute;left:50%;top:16px;transform:translateX(-50%);background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px}
     .debug{position:absolute;top:50px;left:10px;background:rgba(0,0,0,0.8);color:#fff;padding:10px;border-radius:5px;font-size:12px;font-family:monospace}
-    .camera-help{position:absolute;bottom:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:8px;border-radius:5px;font-size:11px;font-family:monospace}
     aside{
       width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,var(--panel),var(--panel2));
       display:flex;flex-direction:column;gap:12px;padding:12px;overflow:auto
@@ -75,8 +70,8 @@
     .muted{color:var(--muted)}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
     .hidden{display:none !important}
-    .error{color:#ef4444;text-align:center;padding:20px}
-    .offline-warning{background:#3a2a14;border:1px solid #7c4a00;color:#f59e0b;padding:10px;margin:10px;border-radius:8px;font-size:12px}
+    /* канвас: гарантированный приём событий колеса и фокус */
+    canvas{display:block;outline:none}
     @media (max-width: 1000px){aside{width:280px}}
     @media (max-width: 860px){
       .layout{flex-direction:column}
@@ -86,21 +81,27 @@
   </style>
 </head>
 <body>
+  <!-- Блокируем дефолтный drop/dragover, чтобы браузер не открывал JSON как текст -->
+  <script>
+    document.addEventListener('dragover', e => e.preventDefault(), false);
+    document.addEventListener('drop', e => e.preventDefault(), false);
+  </script>
+
   <div class="wrap">
     <header>
       <div class="ttl">
         <div style="font-size:20px">🛰️</div>
         <div>
-          <h1>Arena 3D Визуализатор Боев</h1>
-          <div class="sub">3D визуализация боёв с границами поля и радиусом лазера</div>
+          <h1>Arena 3D Battle Visualizer</h1>
+          <div class="sub">3D-визуализация боёв с границами поля и радиусом лазера</div>
         </div>
       </div>
 
       <div class="controls">
-        <button class="btn" id="btnLoad">📂 Загрузить JSON</button>
+        <button class="btn" id="btnLoad">📂 Загрузить JSON боя</button>
         <input type="file" id="fileInput" accept=".json" class="hidden"/>
 
-        <button class="btn ok" id="btnPlay">▶ Воспроизвести</button>
+        <button class="btn ok" id="btnPlay">▶ Пуск</button>
         <button class="btn" id="btnPause">⏸ Пауза</button>
         <button class="btn danger" id="btnReset">⟲ Сброс</button>
 
@@ -112,74 +113,61 @@
 
         <label class="tog">
           <input type="checkbox" id="toggleTrails" checked/>
-          <span>Следы</span>
+          <span>Показывать следы</span>
         </label>
         <label class="tog">
           <input type="checkbox" id="toggleBounds" checked/>
-          <span>Границы</span>
+          <span>Показывать границы</span>
         </label>
         
         <button class="btn warn" id="btnDebug">🐛 Отладка</button>
-        <button class="btn" id="btnCreateDemo">🎮 Демо</button>
+        <button class="btn" id="btnCreateDemo">🎮 Демо-данные</button>
       </div>
     </header>
 
     <div class="layout">
       <section class="viewer">
-        <div id="threejs-container">
-          <div class="loading" id="loading">
-            <div class="spinner"></div>
-            <div>Загрузка 3D движка...</div>
-            <div id="loadingStatus" class="muted">Инициализация</div>
-          </div>
-        </div>
-        <div class="overlay-hint muted mono hidden" id="hint">Загрузите файл battle_3d_*.json или создайте демо-данные</div>
+        <div id="threejs-container"></div>
+        <div class="overlay-hint muted mono" id="hint">Загрузите battle_3d_*.json или создайте демо-данные</div>
         <div class="debug hidden" id="debugInfo">
-          Отладочная информация:<br>
-          THREE.js: <span id="threeStatus">⏳</span><br>
-          Сцена: <span id="sceneStatus">⏳</span><br>
+          Состояние:<br>
+          THREE.js: <span id="threeStatus">❌</span><br>
+          Сцена: <span id="sceneStatus">❌</span><br>
           Данные: <span id="dataStatus">❌</span><br>
-          Кадры: <span id="framesStatus">0</span><br>
+          Кадров: <span id="framesStatus">0</span><br>
           Текущий: <span id="currentStatus">0</span>
-        </div>
-        <div class="camera-help" id="cameraHelp">
-          🖱️ ЛКМ: поворот • 🎡 Колесо: приближение • ПКМ: панорама
         </div>
       </section>
 
       <aside>
-        <div class="offline-warning" id="offlineWarning" style="display:none">
-          ⚠️ Для работы без интернета поместите файлы three.min.js и OrbitControls.js в ту же папку
-        </div>
-        
-        <div class="card drop" id="dropZone">📁 Перетащите 3D battle JSON сюда или нажмите для выбора файла</div>
+        <div class="card drop" id="dropZone">📁 Перетащите JSON боя сюда или нажмите, чтобы выбрать файл</div>
 
         <div class="card">
           <h3>📊 Статистика боя</h3>
           <div class="row">
             <div class="stat red">
-              <div>Красная команда</div>
+              <div>HP команды Red</div>
               <div class="v" id="redHP">0</div>
             </div>
             <div class="stat blue">
-              <div>Синяя команда</div>
+              <div>HP команды Blue</div>
               <div class="v" id="blueHP">0</div>
             </div>
           </div>
           <div class="row" style="margin-top:8px">
             <div class="stat">
-              <div>Живых</div>
+              <div>Живы</div>
               <div class="v" id="aliveCount">0</div>
             </div>
             <div class="stat">
               <div>Время</div>
-              <div class="v" id="battleTime">0с</div>
+              <div class="v" id="battleTime">0s</div>
             </div>
           </div>
         </div>
 
         <div class="card timeline">
-          <h3>⏰ Временная шкала</h3>
+          <h3>⏰ Шкала времени</h3>
           <input type="range" id="frame" min="0" max="0" value="0"/>
           <div class="kv"><span>Кадр: <span id="cur">0</span></span><span>Всего: <span id="tot">0</span></span></div>
         </div>
@@ -190,10 +178,10 @@
             <button class="btn" data-cam="overview">🏟️ Обзор</button>
             <button class="btn" data-cam="side">📐 Сбоку</button>
             <button class="btn" data-cam="top">⬇️ Сверху</button>
-            <button class="btn" data-cam="follow">🎯 Следить</button>
+            <button class="btn" data-cam="follow">🎯 Следовать</button>
           </div>
           <div class="muted" style="margin-top:8px">
-            🖱️ Поворот/Приближение • ⤢ ПКМ: панорама
+            🖱️ Вращение/Зум • ⤢ Правая кнопка: Панорама
           </div>
         </div>
 
@@ -210,307 +198,129 @@
     </div>
   </div>
 
+  <!-- THREE.js: основная библиотека -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
+  <!-- Пытаемся загрузить нон-модуль OrbitControls (для глобального THREE) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/examples/js/controls/OrbitControls.js"></script>
+
   <script>
+    // Глобальный флаг отладки
     window.debugMode = false;
-    let loadingElement, loadingStatus;
 
-    function updateLoadingStatus(message) {
-      if (loadingStatus) {
-        loadingStatus.textContent = message;
-      }
-      console.log('📦', message);
-    }
-
-    function loadScript(src, timeout = 8000) {
-      return new Promise((resolve, reject) => {
-        updateLoadingStatus(`Загрузка ${src.split('/').pop()}...`);
-        
-        const script = document.createElement('script');
-        script.src = src;
-        script.async = true;
-        
-        const timeoutId = setTimeout(() => {
-          reject(new Error(`Timeout loading ${src}`));
-        }, timeout);
-        
-        script.onload = () => {
-          clearTimeout(timeoutId);
-          resolve();
-        };
-        
-        script.onerror = () => {
-          clearTimeout(timeoutId);
-          reject(new Error(`Failed to load ${src}`));
-        };
-        
-        document.head.appendChild(script);
+    // Надёжная подгрузка скриптов (fallback для OrbitControls)
+    function loadScript(src){
+      return new Promise((resolve, reject)=>{
+        const s=document.createElement('script');
+        s.src=src;
+        s.onload=resolve;
+        s.onerror=reject;
+        document.head.appendChild(s);
       });
     }
 
-    async function loadThreeJS() {
-      const localFiles = [
-        './three.min.js',
-        './js/three.min.js',
-        './libs/three.min.js'
-      ];
-
-      const localControls = [
-        './OrbitControls.js',
-        './js/OrbitControls.js', 
-        './libs/OrbitControls.js'
-      ];
-
-      const threeCDNs = [
-        'https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js',
-        'https://unpkg.com/three@0.152.2/build/three.min.js',
-        'https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js'
-      ];
-
-      const controlsCDNs = [
-        'https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/examples/js/controls/OrbitControls.js',
-        'https://unpkg.com/three@0.152.2/examples/js/controls/OrbitControls.js',
-        'https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/OrbitControls.js'
-      ];
-
-      const offlineWarning = document.getElementById('offlineWarning');
-      
-      let threeLoaded = false;
-      const allThreeSources = [...localFiles, ...threeCDNs];
-      
-      for (const src of allThreeSources) {
-        try {
-          await loadScript(src, 5000);
-          if (typeof THREE !== 'undefined') {
-            updateLoadingStatus('THREE.js загружен ✅');
-            threeLoaded = true;
-            
-            if (threeCDNs.includes(src)) {
-              offlineWarning.style.display = 'none';
-            } else {
-              updateLoadingStatus('Используются локальные файлы');
-            }
-            break;
-          }
-        } catch (error) {
-          console.warn(`Failed to load THREE.js from ${src}:`, error);
-          if (localFiles.includes(src)) {
-            offlineWarning.style.display = 'block';
-          }
-        }
-      }
-
-      if (!threeLoaded) {
-        throw new Error('Не удалось загрузить THREE.js. Для работы без интернета скачайте three.min.js в папку с файлом.');
-      }
-
-      let controlsLoaded = false;
-      const allControlsSources = [...localControls, ...controlsCDNs];
-      
-      for (const src of allControlsSources) {
-        try {
-          await loadScript(src, 5000);
-          if (typeof THREE.OrbitControls !== 'undefined') {
-            updateLoadingStatus('OrbitControls загружен ✅');
-            controlsLoaded = true;
-            break;
-          }
-        } catch (error) {
-          console.warn(`Failed to load OrbitControls from ${src}:`, error);
-        }
-      }
-
-      if (!controlsLoaded) {
-        updateLoadingStatus('⚠️ OrbitControls не загружены - создаем упрощенное управление');
-        createSimpleControls();
-      }
-
-      return { three: threeLoaded, controls: controlsLoaded };
-    }
-
-    function createSimpleControls() {
-      THREE.OrbitControls = class {
-        constructor(camera, domElement) {
-          this.object = camera;
-          this.domElement = domElement;
-          this.target = new THREE.Vector3();
-          this.enableDamping = true;
-          this.dampingFactor = 0.05;
-          this.minDistance = 1;
-          this.maxDistance = 1000;
-          this.maxPolarAngle = Math.PI;
-          this.enabled = true;
-          
-          this.setupBasicControls();
-        }
-        
-        setupBasicControls() {
-          let isDown = false;
-          let mouseButton = -1;
-          let mouseX = 0, mouseY = 0;
-          
-          this.domElement.addEventListener('mousedown', (e) => {
-            if (e.button === 0) {
-              isDown = true;
-              mouseButton = e.button;
-              mouseX = e.clientX;
-              mouseY = e.clientY;
-            }
-          });
-          
-          this.domElement.addEventListener('mousemove', (e) => {
-            if (isDown) {
-              const deltaX = e.clientX - mouseX;
-              const deltaY = e.clientY - mouseY;
-              
-              const spherical = new THREE.Spherical();
-              spherical.setFromVector3(this.object.position.clone().sub(this.target));
-              spherical.theta -= deltaX * 0.01;
-              spherical.phi += deltaY * 0.01;
-              spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
-              
-              this.object.position.setFromSpherical(spherical).add(this.target);
-              this.object.lookAt(this.target);
-              
-              mouseX = e.clientX;
-              mouseY = e.clientY;
-            }
-          });
-          
-          this.domElement.addEventListener('mouseup', () => {
-            isDown = false;
-            mouseButton = -1;
-          });
-          
-          this.domElement.addEventListener('wheel', (e) => {
-            const scale = e.deltaY > 0 ? 1.1 : 0.9;
-            const direction = this.object.position.clone().sub(this.target);
-            direction.multiplyScalar(scale);
-            this.object.position.copy(this.target).add(direction);
-            e.preventDefault();
-          });
-          
-          this.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
-        }
-        
-        update() {}
-      };
-      console.log('✅ Создана упрощенная система управления камерой');
-    }
-
     class Visualizer {
-      constructor() {
+      constructor(){
         console.log('🎮 Инициализация Arena 3D Visualizer...');
-        
-        this.data = null;
-        this.frames = [];
-        this.bounds = null;
-        this.laser = null;
-        this.cur = 0;
-        this.isPlay = false;
-        this.speed = 1;
-        this.showBounds = true;
-        this.showTrails = true;
-        this.robots = new Map();
-        this.trails = new Map();
-        this.trailsLines = new Map();
-        this.followId = null;
+        this.data=null; this.frames=[]; this.bounds=null; this.laser=null;
+        this.cur=0; this.isPlay=false; this.speed=1; this.showBounds=true; this.showTrails=true;
+        this.recent=[]; this.robots=new Map(); this.trails=new Map(); this.trailsLines=new Map(); this.followId=null;
 
-        this.scene = null;
-        this.camera = null;
-        this.renderer = null;
-        this.controls = null;
-        this.fieldGroup = null;
-
-        this.$ = id => document.getElementById(id);
-        
+        this.$=id=>document.getElementById(id);
         this.hookUI();
         this.hookFile();
-      }
+        this.checkThreeJS();
 
-      async initialize() {
-        try {
-          loadingElement = this.$('loading');
-          loadingStatus = this.$('loadingStatus');
-          
-          updateLoadingStatus('Инициализация...');
-          
-          const { three, controls } = await loadThreeJS();
-          
-          if (!three) {
-            throw new Error('THREE.js не загрузился');
-          }
-
-          updateLoadingStatus('Создание 3D сцены...');
-          await this.init3D();
-
-          if (loadingElement) {
-            loadingElement.style.display = 'none';
-          }
-
-          this.$('hint').classList.remove('hidden');
-          
-          updateLoadingStatus('Готово ✅');
-          console.log('✅ Visualizer полностью инициализирован');
-          
-        } catch (error) {
-          console.error('❌ Ошибка инициализации:', error);
-          this.showError('Ошибка инициализации: ' + error.message);
-        }
-      }
-
-      showError(message) {
-        if (loadingElement) {
-          loadingElement.innerHTML = `
-            <div class="error">
-              <div style="font-size:24px;margin-bottom:10px;">⚠️</div>
-              <div>${message}</div>
-              <div style="margin-top:15px;">
-                <button onclick="location.reload()" class="btn">🔄 Перезагрузить</button>
-              </div>
-              <div style="margin-top:10px;font-size:12px;color:#94a3b8;">
-                Для работы без интернета поместите в папку:
-                <br>• three.min.js
-                <br>• OrbitControls.js
-              </div>
-            </div>
-          `;
-        }
-      }
-
-      hookUI() {
-        this.$('btnLoad').onclick = () => this.$('fileInput').click();
-        this.$('btnPlay').onclick = () => this.play();
-        this.$('btnPause').onclick = () => this.pause();
-        this.$('btnReset').onclick = () => this.reset();
-        this.$('btnDebug').onclick = () => this.toggleDebug();
-        this.$('btnCreateDemo').onclick = () => this.createDemoData();
-
-        this.$('speed').addEventListener('input', e => {
-          this.speed = Number(e.target.value) || 1;
-          this.$('speedVal').textContent = this.speed.toFixed(1) + 'x';
+        // ВАЖНО: ждём гарантированного наличия OrbitControls
+        this.ensureThreeAndControls().then(()=>{
+          this.init3D();
+        }).catch(err=>{
+          console.error('❌ Не удалось подготовить THREE/OrbitControls:', err);
+          this.$('hint').textContent = 'Ошибка загрузки THREE/OrbitControls. Проверьте интернет-соединение.';
         });
+      }
 
-        this.$('toggleTrails').addEventListener('change', e => {
-          this.showTrails = e.target.checked;
+      async ensureThreeAndControls(){
+        if (typeof THREE === 'undefined') {
+          throw new Error('THREE не загружен');
+        }
+        if (typeof THREE.OrbitControls === 'undefined') {
+          console.warn('⚠️ OrbitControls не найден. Загружаю fallback с unpkg…');
+          try {
+            await loadScript('https://unpkg.com/three@0.152.2/examples/js/controls/OrbitControls.js');
+            console.log('✅ OrbitControls загружен с unpkg');
+          } catch(e){
+            console.error('❌ Не удалось загрузить OrbitControls:', e);
+            throw e;
+          }
+        }
+      }
+
+      checkThreeJS() {
+        const status = this.$('threeStatus');
+        if (typeof THREE !== 'undefined') {
+          console.log('✅ THREE.js загружен');
+          status.textContent = '✅';
+          status.style.color = '#22c55e';
+
+          if (typeof THREE.OrbitControls !== 'undefined') {
+            console.log('✅ OrbitControls обнаружен');
+          } else {
+            console.warn('⚠️ OrbitControls пока нет (будет догружен)');
+          }
+        } else {
+          console.error('❌ THREE.js не загружен');
+          status.textContent = '❌ THREE.js не загружен';
+          status.style.color = '#ef4444';
+          this.$('hint').textContent = 'Ошибка: THREE.js не загружен. Проверьте интернет-соединение.';
+        }
+      }
+
+      updateDebugStatus() {
+        if (!window.debugMode) return;
+        this.$('threeStatus').textContent = typeof THREE !== 'undefined' ? '✅' : '❌';
+        this.$('sceneStatus').textContent = this.scene ? '✅' : '❌';
+        this.$('dataStatus').textContent = this.data ? '✅' : '❌';
+        this.$('framesStatus').textContent = this.frames.length;
+        this.$('currentStatus').textContent = this.cur;
+      }
+
+      hookUI(){
+        this.$('btnLoad').onclick=()=>this.$('fileInput').click();
+        this.$('btnPlay').onclick=()=>this.play();
+        this.$('btnPause').onclick=()=>this.pause();
+        this.$('btnReset').onclick=()=>this.reset();
+        this.$('btnDebug').onclick=()=>this.toggleDebug();
+        this.$('btnCreateDemo').onclick=()=>this.createDemoData();
+
+        this.$('speed').addEventListener('input',e=>{
+          this.speed=Number(e.target.value)||1; 
+          this.$('speedVal').textContent=this.speed.toFixed(1)+'x';
+        });
+        
+        this.$('toggleTrails').addEventListener('change',e=>{
+          this.showTrails=e.target.checked;
           if (!this.showTrails) {
-            this.clearTrails();
+            this.trailsLines.forEach(line => {
+              this.scene?.remove(line);
+              line.geometry?.dispose();
+            });
+            this.trailsLines.clear();
+            this.trails.clear();
           }
         });
-
-        this.$('toggleBounds').addEventListener('change', e => {
-          this.showBounds = e.target.checked;
-          if (this.fieldGroup) {
-            this.fieldGroup.visible = this.showBounds;
-          }
+        
+        this.$('toggleBounds').addEventListener('change',e=>{
+          this.showBounds=e.target.checked;
+          if(this.fieldGroup) this.fieldGroup.visible=this.showBounds;
         });
 
-        this.$('frame').addEventListener('input', e => {
-          this.cur = Math.min(this.frames.length - 1, Math.max(0, Number(e.target.value) || 0));
+        this.$('frame').addEventListener('input',e=>{
+          this.cur = Math.min(this.frames.length-1, Math.max(0, Number(e.target.value)||0));
           this.updateFrame(true);
         });
 
-        document.querySelectorAll('[data-cam]').forEach(btn => {
-          btn.addEventListener('click', () => this.setCam(btn.dataset.cam));
+        document.querySelectorAll('[data-cam]').forEach(b=>{
+          b.addEventListener('click',()=>this.setCam(b.dataset.cam));
         });
       }
 
@@ -520,83 +330,69 @@
         if (window.debugMode) {
           debug.classList.remove('hidden');
           this.updateDebugStatus();
-          setInterval(() => this.updateDebugStatus(), 1000);
+          if (!this._dbgInterval) {
+            this._dbgInterval = setInterval(() => this.updateDebugStatus(), 1000);
+          }
         } else {
           debug.classList.add('hidden');
+          if (this._dbgInterval){ clearInterval(this._dbgInterval); this._dbgInterval = null; }
         }
       }
 
-      updateDebugStatus() {
-        if (!window.debugMode) return;
+      hookFile(){
+        const input=this.$('fileInput');
+        const drop =this.$('dropZone');
         
-        this.$('threeStatus').textContent = typeof THREE !== 'undefined' ? '✅' : '❌';
-        this.$('sceneStatus').textContent = this.scene ? '✅' : '❌';
-        this.$('dataStatus').textContent = this.data ? '✅' : '❌';
-        this.$('framesStatus').textContent = this.frames.length;
-        this.$('currentStatus').textContent = this.cur;
-      }
-
-      hookFile() {
-        const input = this.$('fileInput');
-        const drop = this.$('dropZone');
-
-        input.onchange = e => {
-          if (e.target.files && e.target.files[0]) {
+        input.onchange=(e)=>{ 
+          if(e.target.files && e.target.files[0]) {
             console.log('📁 Файл выбран:', e.target.files[0].name);
-            this.loadFile(e.target.files[0]);
+            this.loadFile(e.target.files[0]); 
           }
         };
-
-        drop.addEventListener('click', () => input.click());
-        drop.addEventListener('dragover', e => {
-          e.preventDefault();
-          drop.classList.add('drag');
-        });
-        drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
-        drop.addEventListener('drop', e => {
-          e.preventDefault();
-          drop.classList.remove('drag');
-          const file = e.dataTransfer.files && e.dataTransfer.files[0];
-          if (file) {
-            console.log('📁 Файл перетащен:', file.name);
-            this.loadFile(file);
+        
+        drop.addEventListener('click',()=>input.click());
+        drop.addEventListener('dragover',e=>{e.preventDefault(); drop.classList.add('drag');});
+        drop.addEventListener('dragleave',()=>drop.classList.remove('drag'));
+        drop.addEventListener('drop',e=>{
+          e.preventDefault(); drop.classList.remove('drag');
+          const f=e.dataTransfer.files && e.dataTransfer.files[0]; 
+          if(f) {
+            console.log('📁 Файл сброшен:', f.name);
+            this.loadFile(f);
           }
         });
-
-        document.addEventListener('dragover', e => e.preventDefault());
-        document.addEventListener('drop', e => e.preventDefault());
       }
 
-      async loadFile(file) {
+      async loadFile(file){
         try {
-          console.log('📖 Чтение файла...');
-          const text = await file.text();
-          const json = JSON.parse(text);
-          console.log('✅ JSON успешно разобран, кадров:', json.frames?.length || 0);
+          console.log('📖 Чтение файла…');
+          const txt = await file.text();
+          console.log('📊 Парсинг JSON…');
+          const json = JSON.parse(txt);
+          console.log('✅ JSON распарсен, кадров:', json.frames?.length || 0);
           this.ingest(json);
-        } catch (error) {
-          console.error('❌ Ошибка загрузки файла:', error);
-          alert('Не удалось загрузить файл: ' + error.message);
+        } catch(e) { 
+          console.error('❌ Ошибка загрузки файла:', e);
+          alert('Не удалось загрузить файл: ' + e.message); 
         }
       }
 
       createDemoData() {
-        console.log('🎮 Создание демо-данных...');
-
+        console.log('🎮 Создание демо-данных…');
         const demoData = {
           battle_id: "demo_battle_3d",
           start_time: Date.now() / 1000,
-          end_time: Date.now() / 1000 + 12,
+          end_time: Date.now() / 1000 + 10,
           red_team_size: 2,
           blue_team_size: 2,
           winner: "red",
-          field_bounds: { x_min: -10, x_max: 10, y_min: -8, y_max: 8, z_min: 0, z_max: 6 },
-          laser_config: { max_range: 8, damage: 15 },
+          field_bounds: {x_min: -10, x_max: 10, y_min: -8, y_max: 8, z_min: 0, z_max: 6},
+          laser_config: {max_range: 8, damage: 15},
           boundary_deaths: 0,
           frames: []
         };
 
-        for (let i = 0; i < 60; i++) {
+        for (let i = 0; i < 50; i++) {
           const frame = {
             timestamp: demoData.start_time + i * 0.2,
             step: i,
@@ -611,29 +407,31 @@
                 x: -5 + Math.sin(i * 0.1) * 2,
                 y: -2 + Math.cos(i * 0.15) * 1.5,
                 z: 2 + Math.sin(i * 0.2) * 1,
-                hp: Math.max(0, 100 - i * 1.2),
-                alive: 100 - i * 1.2 > 0,
+                hp: Math.max(0, 100 - i * 1.5),
+                alive: 100 - i * 1.5 > 0,
                 within_bounds: true,
                 target_enemy: 0,
                 move_action: [0.1, 0.05, 0.02],
                 aim_action: [0.2, -0.1, 0.0],
                 fire_action: i % 10 === 0,
-                laser_range: 8.0
+                laser_range: 8.0,
+                can_shoot_targets: ["blue_0", "blue_1"]
               },
               {
-                id: "red_1",
+                id: "red_1", 
                 team: "red",
                 x: -3 + Math.cos(i * 0.12) * 1.5,
                 y: 1 + Math.sin(i * 0.18) * 2,
                 z: 1.5 + Math.cos(i * 0.25) * 0.8,
-                hp: Math.max(0, 100 - i * 1.0),
-                alive: 100 - i * 1.0 > 0,
+                hp: Math.max(0, 100 - i * 1.2),
+                alive: 100 - i * 1.2 > 0,
                 within_bounds: true,
                 target_enemy: 1,
                 move_action: [-0.05, 0.1, -0.01],
                 aim_action: [-0.15, 0.2, 0.05],
                 fire_action: i % 8 === 0,
-                laser_range: 8.0
+                laser_range: 8.0,
+                can_shoot_targets: ["blue_0"]
               },
               {
                 id: "blue_0",
@@ -641,29 +439,31 @@
                 x: 5 + Math.sin(i * 0.11) * -1.8,
                 y: 2 + Math.cos(i * 0.16) * -1.2,
                 z: 2.5 + Math.sin(i * 0.22) * 0.9,
-                hp: Math.max(0, 100 - i * 1.5),
-                alive: 100 - i * 1.5 > 0,
+                hp: Math.max(0, 100 - i * 2.0),
+                alive: 100 - i * 2.0 > 0,
                 within_bounds: true,
                 target_enemy: 0,
                 move_action: [-0.1, -0.08, 0.03],
                 aim_action: [-0.25, 0.15, -0.02],
-				fire_action: i % 12 === 0,
-                laser_range: 8.0
+                fire_action: i % 12 === 0,
+                laser_range: 8.0,
+                can_shoot_targets: ["red_0", "red_1"]
               },
               {
                 id: "blue_1",
-                team: "blue",
+                team: "blue", 
                 x: 3 + Math.cos(i * 0.13) * -2.2,
                 y: -1 + Math.sin(i * 0.14) * -1.8,
                 z: 1.8 + Math.cos(i * 0.28) * 1.1,
-                hp: Math.max(0, 100 - i * 1.3),
-                alive: 100 - i * 1.3 > 0,
+                hp: Math.max(0, 100 - i * 1.8),
+                alive: 100 - i * 1.8 > 0,
                 within_bounds: true,
                 target_enemy: 1,
                 move_action: [0.08, -0.12, -0.02],
                 aim_action: [0.18, -0.22, 0.08],
                 fire_action: i % 15 === 0,
-                laser_range: 8.0
+                laser_range: 8.0,
+                can_shoot_targets: ["red_1"]
               }
             ]
           };
@@ -683,268 +483,151 @@
           demoData.frames.push(frame);
         }
 
-        console.log('✅ Демо-данные созданы с', demoData.frames.length, 'кадрами');
+        console.log('✅ Демо-данные созданы, кадров:', demoData.frames.length);
         this.ingest(demoData);
       }
 
-      ingest(json) {
-        console.log('📥 Обработка данных боя...');
-
+      ingest(json){
+        console.log('📥 Приём данных боя…');
         this.data = json;
         this.frames = Array.isArray(json.frames) ? json.frames : [];
-        this.bounds = json.field_bounds || (this.frames[0]?.field_bounds) || 
-                     { x_min: -10, x_max: 10, y_min: -8, y_max: 8, z_min: 0, z_max: 6 };
-        this.laser = json.laser_config || { max_range: 8, damage: 15, accuracy_falloff: 0.1 };
-
-        console.log('📊 Данные боя:', {
-          id: json.battle_id,
-          frames: this.frames.length,
-          bounds: this.bounds,
-          laser: this.laser
-        });
+        this.bounds = json.field_bounds || (this.frames[0]?.field_bounds) || {x_min:-10,x_max:10,y_min:-8,y_max:8,z_min:0,z_max:6};
+        this.laser = json.laser_config || {max_range:8,damage:15,accuracy_falloff:0.1};
 
         this.$('tot').textContent = this.frames.length;
-        this.$('frame').max = this.frames.length ? (this.frames.length - 1) : 0;
+        this.$('frame').max = this.frames.length ? (this.frames.length-1) : 0;
         this.$('hint').classList.add('hidden');
 
-        this.clearScene();
-
-        if (this.scene) {
-          this.buildField();
-        }
-
-        this.pause();
-        this.cur = 0;
-        this.updateFrame(true);
-
-        console.log('✅ Данные боя успешно загружены');
-      }
-
-      clearScene() {
         this.robots.clear();
-        this.clearTrails();
-      }
-    }
-
-    window.addEventListener('load', () => {
-      console.log('🚀 Запуск Arena 3D Visualizer...');
-      
-      window.visualizer = new Visualizer();
-      window.visualizer.initialize().catch(error => {
-        console.error('❌ Ошибка инициализации visualizer:', error);
-      });
-    });
-
-    window.debugVis = {
-      createTestRobot: () => {
-        if (window.visualizer && window.visualizer.scene) {
-          const testData = {
-            id: "test_robot",
-            team: "red",
-            x: 0, y: 0, z: 2,
-            hp: 75,
-            alive: true,
-            within_bounds: true,
-            target_enemy: 0,
-            move_action: [0.1, 0.0, 0.0],
-            aim_action: [1.0, 0.0, 0.0],
-            fire_action: false
-          };
-
-          const robot = window.visualizer.createRobotMesh(testData);
-          window.visualizer.scene.add(robot);
-          window.visualizer.robots.set("test_robot", robot);
-          window.visualizer.updateRobotMesh(robot, testData);
-
-          console.log('🤖 Тестовый робот создан');
-        }
-      },
-
-      logScene: () => {
-        if (window.visualizer && window.visualizer.scene) {
-          console.log('Объекты сцены:', window.visualizer.scene.children.length);
-          console.log('Роботы:', window.visualizer.robots.size);
-          console.log('Текущий кадр:', window.visualizer.cur);
-          console.log('Всего кадров:', window.visualizer.frames.length);
-        }
-      },
-
-      testCamera: () => {
-        if (window.visualizer && window.visualizer.controls) {
-          console.log('Камера позиция:', window.visualizer.camera.position);
-          console.log('Камера цель:', window.visualizer.controls.target);
-          console.log('Контролы включены:', window.visualizer.controls.enabled);
-        }
-      },
-
-      resetCamera: () => {
-        if (window.visualizer) {
-          window.visualizer.setCam('overview');
-          console.log('📷 Камера сброшена на обзорный ракурс');
-        }
-      }
-    };
-  </script>
-</body>
-</html>
-        
-        if (this.scene) {
-          const toRemove = [];
-          this.scene.traverse(child => {
-            if (child.name && (child.name.startsWith('red_') || child.name.startsWith('blue_'))) {
-              toRemove.push(child);
-            }
-          });
-          toRemove.forEach(child => this.scene.remove(child));
-        }
-      }
-
-      clearTrails() {
         this.trails.clear();
         this.trailsLines.forEach(line => {
-          if (this.scene) this.scene.remove(line);
-          if (line.geometry) line.geometry.dispose();
+          this.scene?.remove(line);
+          line.geometry?.dispose();
         });
         this.trailsLines.clear();
+
+        if (!this.scene && typeof THREE !== 'undefined') {
+          console.log('🎬 Создаю 3D сцену (поздняя инициализация)…');
+          this.init3D();
+        }
+        if (this.scene) this.updateField();
+        
+        this.pause(); 
+        this.cur = 0; 
+        this.updateFrame(true);
+        console.log('✅ Данные боя загружены');
       }
 
-      async init3D() {
+      /* =============== 3D =============== */
+      init3D(){
         if (typeof THREE === 'undefined') {
-          throw new Error('THREE.js не загружен');
+          console.error('❌ THREE.js не загружен');
+          return;
         }
+        try {
+          console.log('🎬 Инициализация 3D…');
+          const cont = this.$('threejs-container');
 
-        console.log('🎬 Инициализация 3D сцены...');
+          this.scene = new THREE.Scene();
+          this.scene.fog = new THREE.Fog(0x0b1020, 30, 80);
 
-        const container = this.$('threejs-container');
+          const w=cont.clientWidth||800, h=cont.clientHeight||600;
+          this.camera = new THREE.PerspectiveCamera(60, w/h, 0.1, 500);
+          this.camera.position.set(18, 14, 18);
 
-        this.scene = new THREE.Scene();
-        this.scene.fog = new THREE.Fog(0x0b1020, 30, 80);
+          this.renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
+          this.renderer.setPixelRatio(window.devicePixelRatio||1);
+          this.renderer.setSize(w,h);
+          this.renderer.setClearColor(0x071019,1);
+          this.renderer.shadowMap.enabled = true;
+          this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+          cont.innerHTML='';
+          cont.appendChild(this.renderer.domElement);
 
-        const width = container.clientWidth || 800;
-        const height = container.clientHeight || 600;
-        this.camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 500);
-        this.camera.position.set(18, 14, 18);
+          // Ключевые настройки для стабильного управления
+          this.renderer.domElement.style.touchAction = 'none'; // жесты/тач
+          this.renderer.domElement.tabIndex = 0;               // фокус для колеса мыши
+          this.renderer.domElement.addEventListener('contextmenu', e=> e.preventDefault()); // пэн правой кнопкой без меню
 
-        this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-        this.renderer.setPixelRatio(window.devicePixelRatio || 1);
-        this.renderer.setSize(width, height);
-        this.renderer.setClearColor(0x071019, 1);
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-
-        container.innerHTML = '';
-        container.appendChild(this.renderer.domElement);
-
-        if (THREE.OrbitControls) {
-          try {
+          // OrbitControls
+          if (typeof THREE.OrbitControls !== 'undefined') {
             this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
-            
-            this.controls.enableDamping = true;
-            this.controls.dampingFactor = 0.05;
-            this.controls.screenSpacePanning = false;
-            
-            this.controls.minDistance = 2;
-            this.controls.maxDistance = 100;
+            this.controls.enableDamping=true; 
+            this.controls.dampingFactor=.08;
+            this.controls.minDistance=4; 
+            this.controls.maxDistance=80;
             this.controls.maxPolarAngle = Math.PI * 0.9;
-            
-            this.controls.rotateSpeed = 1.0;
-            this.controls.panSpeed = 0.8;
-            this.controls.zoomSpeed = 1.0;
-            
             this.controls.enableRotate = true;
-            this.controls.enableZoom = true;
             this.controls.enablePan = true;
-            
-            console.log('✅ OrbitControls инициализированы с настройками');
-            this.$('cameraHelp').style.display = 'block';
-            
-          } catch (error) {
-            console.error('❌ Ошибка инициализации OrbitControls:', error);
+            this.controls.enableZoom = true;
+          } else {
+            console.warn('⚠️ OrbitControls недоступен даже после догрузки');
           }
-        } else {
-          console.warn('⚠️ OrbitControls недоступны');
+
+          const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+          this.scene.add(ambient);
+          
+          const directional = new THREE.DirectionalLight(0xffffff, 0.8);
+          directional.position.set(16, 24, 12);
+          directional.castShadow = true;
+          directional.shadow.mapSize.width = 2048;
+          directional.shadow.mapSize.height = 2048;
+          this.scene.add(directional);
+
+          this.fieldGroup = new THREE.Group();
+          this.scene.add(this.fieldGroup);
+          this.buildField();
+
+          this.renderer.domElement.addEventListener('click', e => this.onClick(e));
+
+          const onResize = () => {
+            const w = cont.clientWidth, h = cont.clientHeight;
+            this.camera.aspect = w / h;
+            this.camera.updateProjectionMatrix();
+            this.renderer.setSize(w, h);
+          };
+          window.addEventListener('resize', onResize);
+
+          const animate = () => {
+            requestAnimationFrame(animate);
+            if (this.controls) this.controls.update();
+            if (this.showTrails && this.trails.size) this.updateTrails();
+
+            if (this.followId && this.robots.has(this.followId)) {
+              const robotGroup = this.robots.get(this.followId);
+              const offset = new THREE.Vector3(4, 3, 6);
+              const targetPos = robotGroup.position.clone().add(offset);
+              this.camera.position.lerp(targetPos, 0.05);
+              if (this.controls) this.controls.target.lerp(robotGroup.position, 0.1);
+            }
+            this.renderer.render(this.scene, this.camera);
+          };
+          animate();
+
+          this.$('sceneStatus').textContent = '✅';
+          this.$('sceneStatus').style.color = '#22c55e';
+          console.log('✅ 3D инициализировано');
+          
+        } catch (error) {
+          console.error('❌ Ошибка инициализации 3D:', error);
+          this.$('hint').textContent = '3D инициализация не удалась: ' + error.message;
         }
-
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
-        this.scene.add(ambientLight);
-
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-        directionalLight.position.set(16, 24, 12);
-        directionalLight.castShadow = true;
-        directionalLight.shadow.mapSize.width = 2048;
-        directionalLight.shadow.mapSize.height = 2048;
-        directionalLight.shadow.camera.near = 0.1;
-        directionalLight.shadow.camera.far = 50;
-        directionalLight.shadow.camera.left = -20;
-        directionalLight.shadow.camera.right = 20;
-        directionalLight.shadow.camera.top = 20;
-        directionalLight.shadow.camera.bottom = -20;
-        this.scene.add(directionalLight);
-
-        this.fieldGroup = new THREE.Group();
-        this.scene.add(this.fieldGroup);
-        this.buildField();
-
-        this.renderer.domElement.addEventListener('click', e => this.onClick(e));
-
-        const onResize = () => {
-          const w = container.clientWidth;
-          const h = container.clientHeight;
-          this.camera.aspect = w / h;
-          this.camera.updateProjectionMatrix();
-          this.renderer.setSize(w, h);
-        };
-        window.addEventListener('resize', onResize);
-
-        const animate = () => {
-          requestAnimationFrame(animate);
-
-          if (this.controls && this.controls.update) {
-            this.controls.update();
-          }
-
-          if (this.showTrails && this.trails.size > 0) {
-            this.updateTrails();
-          }
-
-          if (this.followId && this.robots.has(this.followId) && this.controls) {
-            const robotGroup = this.robots.get(this.followId);
-            const offset = new THREE.Vector3(4, 3, 6);
-            const targetPos = robotGroup.position.clone().add(offset);
-            
-            this.camera.position.lerp(targetPos, 0.02);
-            this.controls.target.lerp(robotGroup.position, 0.05);
-          }
-
-          this.renderer.render(this.scene, this.camera);
-        };
-        animate();
-
-        this.updateDebugStatus();
-        console.log('✅ 3D сцена полностью инициализирована');
       }
 
-      buildField() {
+      buildField(){
         if (!this.bounds || !this.scene) return;
-
-        console.log('🏟️ Создание 3D поля с границами:', this.bounds);
-
         this.fieldGroup.clear();
-
+        
         const b = this.bounds;
         const W = b.x_max - b.x_min;
-        const H = b.y_max - b.y_min;
+        const H = b.y_max - b.y_min; 
         const D = b.z_max - b.z_min;
         const centerX = (b.x_min + b.x_max) / 2;
         const centerY = (b.y_min + b.y_max) / 2;
         const centerZ = (b.z_min + b.z_max) / 2;
 
         const planeGeometry = new THREE.PlaneGeometry(W, H);
-        const planeMaterial = new THREE.MeshLambertMaterial({
-          color: 0x0b2a3a,
-          transparent: true,
-          opacity: 0.3
-        });
+        const planeMaterial = new THREE.MeshLambertMaterial({ color: 0x0b2a3a, transparent: true, opacity: 0.3 });
         const plane = new THREE.Mesh(planeGeometry, planeMaterial);
         plane.rotation.x = -Math.PI / 2;
         plane.position.set(centerX, b.z_min, centerY);
@@ -956,26 +639,19 @@
         this.fieldGroup.add(gridHelper);
 
         const boxGeometry = new THREE.BoxGeometry(W, D, H);
-        const boxMaterial = new THREE.MeshBasicMaterial({
-          color: 0x3b82f6,
-          wireframe: true,
-          transparent: true,
-          opacity: 0.6
-        });
+        const boxMaterial = new THREE.MeshBasicMaterial({ color: 0x3b82f6, wireframe: true, transparent: true, opacity: 0.6 });
         const boxHelper = new THREE.Mesh(boxGeometry, boxMaterial);
         boxHelper.position.set(centerX, centerZ, centerY);
         this.fieldGroup.add(boxHelper);
 
         const cornerMaterial = new THREE.MeshBasicMaterial({ color: 0xff6b6b });
         const cornerGeometry = new THREE.SphereGeometry(0.2, 8, 8);
-
         const corners = [
           [b.x_min, b.z_min, b.y_min], [b.x_max, b.z_min, b.y_min],
           [b.x_min, b.z_min, b.y_max], [b.x_max, b.z_min, b.y_max],
           [b.x_min, b.z_max, b.y_min], [b.x_max, b.z_max, b.y_min],
           [b.x_min, b.z_max, b.y_max], [b.x_max, b.z_max, b.y_max]
         ];
-
         corners.forEach(([x, y, z]) => {
           const corner = new THREE.Mesh(cornerGeometry, cornerMaterial);
           corner.position.set(x, y, z);
@@ -991,109 +667,68 @@
         this.fieldGroup.add(centerLine);
 
         this.fieldGroup.visible = this.showBounds;
-        console.log('✅ 3D поле успешно создано');
       }
 
-      createRobotMesh(data) {
-        console.log('🤖 Создание меша робота для:', data.id);
+      updateField() {
+        if (this.fieldGroup && this.bounds) this.buildField();
+      }
 
-        const group = new THREE.Group();
-        group.name = data.id;
+      /* ============ Кадры/Роботы ============ */
+      createRobotMesh(data){
+        const group = new THREE.Group(); group.name = data.id;
 
         const bodyGeometry = new THREE.BoxGeometry(0.8, 0.6, 0.8);
-        const bodyMaterial = new THREE.MeshStandardMaterial({
-          color: data.team === 'red' ? 0xff5757 : 0x5b8dff,
-          metalness: 0.2,
-          roughness: 0.4
-        });
+        const bodyMaterial = new THREE.MeshStandardMaterial({ color: data.team === 'red' ? 0xff5757 : 0x5b8dff, metalness: 0.2, roughness: 0.4 });
         const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-        body.position.y = 0.3;
-        body.castShadow = true;
-        body.receiveShadow = true;
-        group.add(body);
+        body.position.y = 0.3; body.castShadow = true; body.receiveShadow = true; group.add(body);
 
         const headGeometry = new THREE.CylinderGeometry(0.25, 0.3, 0.3, 8);
-        const headMaterial = new THREE.MeshStandardMaterial({
-          color: data.team === 'red' ? 0xcc4444 : 0x4477cc,
-          metalness: 0.3,
-          roughness: 0.3
-        });
+        const headMaterial = new THREE.MeshStandardMaterial({ color: data.team === 'red' ? 0xcc4444 : 0x4477cc, metalness: 0.3, roughness: 0.3 });
         const head = new THREE.Mesh(headGeometry, headMaterial);
-        head.position.y = 0.75;
-        head.castShadow = true;
-        group.add(head);
+        head.position.y = 0.75; head.castShadow = true; group.add(head);
 
         const gunGeometry = new THREE.CylinderGeometry(0.05, 0.08, 0.8, 8);
-        const gunMaterial = new THREE.MeshStandardMaterial({
-          color: 0xffe066,
-          emissive: 0x332200,
-          emissiveIntensity: 0.3,
-          metalness: 0.7,
-          roughness: 0.2
-        });
+        const gunMaterial = new THREE.MeshStandardMaterial({ color: 0xffe066, emissive: 0x332200, emissiveIntensity: 0.3, metalness: 0.7, roughness: 0.2 });
         const gun = new THREE.Mesh(gunGeometry, gunMaterial);
-        gun.rotation.z = Math.PI / 2;
-        gun.position.set(0.6, 0.4, 0);
-        gun.name = 'gun';
-        gun.castShadow = true;
-        group.add(gun);
+        gun.rotation.z = Math.PI / 2; gun.position.set(0.6, 0.4, 0); gun.name = 'gun'; gun.castShadow = true; group.add(gun);
 
         const hpBgGeometry = new THREE.PlaneGeometry(1.0, 0.1);
-        const hpBgMaterial = new THREE.MeshBasicMaterial({
-          color: 0x334155,
-          transparent: true,
-          opacity: 0.8
-        });
+        const hpBgMaterial = new THREE.MeshBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.8 });
         const hpBg = new THREE.Mesh(hpBgGeometry, hpBgMaterial);
-        hpBg.position.set(0, 1.2, 0);
-        hpBg.name = 'hpBg';
-        group.add(hpBg);
+        hpBg.position.set(0, 1.2, 0); hpBg.name = 'hpBg'; group.add(hpBg);
 
         const hpGeometry = new THREE.PlaneGeometry(1.0, 0.1);
-        const hpMaterial = new THREE.MeshBasicMaterial({
-          color: 0x22c55e,
-          transparent: true,
-          opacity: 0.9
-        });
+        const hpMaterial = new THREE.MeshBasicMaterial({ color: 0x22c55e, transparent: true, opacity: 0.9 });
         const hp = new THREE.Mesh(hpGeometry, hpMaterial);
-        hp.position.set(0, 1.2, 0.01);
-        hp.name = 'hp';
-        group.add(hp);
+        hp.position.set(0, 1.2, 0.01); hp.name = 'hp'; group.add(hp);
 
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
-        canvas.width = 256;
-        canvas.height = 64;
-        context.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        context.fillRect(0, 0, 256, 64);
+        canvas.width = 256; canvas.height = 64;
+        context.fillStyle = 'rgba(0, 0, 0, 0.7)'; context.fillRect(0, 0, 256, 64);
         context.fillStyle = data.team === 'red' ? '#ff5757' : '#5b8dff';
-        context.font = '24px Arial';
-        context.textAlign = 'center';
+        context.font = '24px Arial'; context.textAlign = 'center';
         context.fillText(data.id, 128, 40);
-
         const labelTexture = new THREE.CanvasTexture(canvas);
-        const labelMaterial = new THREE.MeshBasicMaterial({
-          map: labelTexture,
-          transparent: true,
-          alphaTest: 0.1
-        });
+        const labelMaterial = new THREE.MeshBasicMaterial({ map: labelTexture, transparent: true, alphaTest: 0.1 });
         const labelGeometry = new THREE.PlaneGeometry(1.5, 0.4);
         const label = new THREE.Mesh(labelGeometry, labelMaterial);
-        label.position.set(0, 1.6, 0);
-        label.name = 'label';
-        group.add(label);
+        label.position.set(0, 1.6, 0); label.name = 'label'; group.add(label);
 
-        group.userData = {
+        group.userData = { 
           selected: false,
-          team: data.team
+          team: data.team,
+          originalColors: {
+            body: bodyMaterial.color.clone(),
+            head: headMaterial.color.clone(),
+            gun: gunMaterial.color.clone()
+          }
         };
-
         return group;
       }
 
-      updateRobotMesh(group, data) {
+      updateRobotMesh(group, data){
         if (!group || !data) return;
-
         group.position.set(data.x || 0, data.z || 2, data.y || 0);
 
         const hp = group.getObjectByName('hp');
@@ -1101,7 +736,6 @@
           const hpPercent = Math.max(0, Math.min(1, (data.hp || 0) / 100));
           hp.scale.x = hpPercent;
           hp.position.x = (hpPercent - 1) * 0.5;
-
           if (hpPercent > 0.6) hp.material.color.setHex(0x22c55e);
           else if (hpPercent > 0.3) hp.material.color.setHex(0xf59e0b);
           else hp.material.color.setHex(0xef4444);
@@ -1110,17 +744,29 @@
         const scaleAlive = data.alive ? 1 : 0.7;
         group.scale.set(scaleAlive, scaleAlive, scaleAlive);
 
-        if (this.showTrails && data.alive) {
-          if (!this.trails.has(data.id)) {
-            this.trails.set(data.id, []);
+        const body = group.children.find(c => c.geometry instanceof THREE.BoxGeometry);
+        const head = group.children.find(c => c.geometry instanceof THREE.CylinderGeometry);
+        if (body && head) {
+          if (!data.within_bounds || !data.alive) {
+            body.material.color.setHex(data.team === 'red' ? 0x884444 : 0x444488);
+            head.material.color.setHex(data.team === 'red' ? 0x662222 : 0x222266);
+          } else {
+            body.material.color.setHex(data.team === 'red' ? 0xff5757 : 0x5b8dff);
+            head.material.color.setHex(data.team === 'red' ? 0xcc4444 : 0x4477cc);
           }
-          const trail = this.trails.get(data.id);
-          const currentPos = new THREE.Vector3(
-            group.position.x,
-            group.position.y + 0.1,
-            group.position.z
-          );
+        }
 
+        const gun = group.getObjectByName('gun');
+        if (gun && data.aim_action && Array.isArray(data.aim_action)) {
+          const [aimX, aimY, aimZ] = data.aim_action;
+          gun.rotation.y = Math.atan2(aimX || 0, aimZ || 0);
+          gun.rotation.x = -(aimY || 0) * 0.5;
+        }
+
+        if (this.showTrails && data.alive) {
+          if (!this.trails.has(data.id)) this.trails.set(data.id, []);
+          const trail = this.trails.get(data.id);
+          const currentPos = new THREE.Vector3(group.position.x, group.position.y + 0.1, group.position.z);
           if (trail.length === 0 || currentPos.distanceTo(trail[trail.length - 1]) > 0.1) {
             trail.push(currentPos);
             if (trail.length > 100) trail.shift();
@@ -1134,61 +780,33 @@
 
       createLaserEffect(position, aimDirection) {
         const laserGeometry = new THREE.CylinderGeometry(0.02, 0.02, 8, 8);
-        const laserMaterial = new THREE.MeshBasicMaterial({
-          color: 0xff6600,
-          transparent: true,
-          opacity: 0.8,
-          emissive: 0xff3300,
-          emissiveIntensity: 0.5
-        });
-
+        const laserMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.8 });
         const laser = new THREE.Mesh(laserGeometry, laserMaterial);
-        laser.position.copy(position);
-        laser.position.y += 0.4;
-
+        laser.position.copy(position); laser.position.y += 0.4;
         const [aimX, aimY, aimZ] = aimDirection;
         const direction = new THREE.Vector3(aimX || 1, aimY || 0, aimZ || 0).normalize();
-        laser.lookAt(laser.position.clone().add(direction));
-        laser.rotateX(Math.PI / 2);
-
+        laser.lookAt(laser.position.clone().add(direction)); laser.rotateX(Math.PI / 2);
         this.scene.add(laser);
-
         let opacity = 0.8;
         const fadeOut = () => {
-          opacity -= 0.05;
-          laser.material.opacity = opacity;
-          if (opacity <= 0) {
-            this.scene.remove(laser);
-            laser.geometry.dispose();
-            laser.material.dispose();
-          } else {
-            requestAnimationFrame(fadeOut);
-          }
+          opacity -= 0.05; laser.material.opacity = opacity;
+          if (opacity <= 0) { this.scene.remove(laser); laser.geometry.dispose(); laser.material.dispose(); }
+          else { requestAnimationFrame(fadeOut); }
         };
-
         setTimeout(fadeOut, 100);
       }
 
-      updateTrails() {
+      updateTrails(){
         if (!this.showTrails) return;
-
         for (const [robotId, points] of this.trails.entries()) {
           if (points.length < 2) continue;
-
           let trailLine = this.trailsLines.get(robotId);
           const geometry = new THREE.BufferGeometry().setFromPoints(points);
-
           if (!trailLine) {
             const robot = this.robots.get(robotId);
             const isRed = robot?.userData?.team === 'red';
             const color = isRed ? 0xff9999 : 0x9999ff;
-
-            const material = new THREE.LineBasicMaterial({
-              color: color,
-              transparent: true,
-              opacity: 0.6
-            });
-
+            const material = new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: 0.6 });
             trailLine = new THREE.Line(geometry, material);
             this.trailsLines.set(robotId, trailLine);
             this.scene.add(trailLine);
@@ -1199,21 +817,17 @@
         }
       }
 
-      updateFrame(syncSlider = false) {
+      updateFrame(syncSlider = false){
         if (!this.frames.length || !this.scene) return;
-
-        const frame = this.frames[this.cur];
-        if (!frame) return;
+        const frame = this.frames[this.cur]; if (!frame) return;
 
         (frame.robots || []).forEach(robotData => {
           let robotGroup = this.robots.get(robotData.id);
-
           if (!robotGroup) {
             robotGroup = this.createRobotMesh(robotData);
             this.scene.add(robotGroup);
             this.robots.set(robotData.id, robotGroup);
           }
-
           this.updateRobotMesh(robotGroup, robotData);
         });
 
@@ -1226,92 +840,68 @@
         }
 
         this.updateBattleStats(frame.robots || []);
-
         const startTime = this.data?.start_time || 0;
         const currentTime = (frame.timestamp || 0) - startTime;
-        this.$('battleTime').textContent = (currentTime > 0 ? currentTime.toFixed(1) : '0') + 'с';
+        this.$('battleTime').textContent = (currentTime > 0 ? currentTime.toFixed(1) : '0') + 's';
 
         if (syncSlider) {
           this.$('cur').textContent = this.cur;
           this.$('frame').value = this.cur;
         }
-
         this.renderEvents(frame.events || []);
         this.updateDebugStatus();
       }
 
       updateBattleStats(robots) {
         let redHP = 0, blueHP = 0, alive = 0;
-
         robots.forEach(robot => {
           if (robot.alive) {
             alive++;
-            if (robot.team === 'red') {
-              redHP += robot.hp || 0;
-            } else if (robot.team === 'blue') {
-              blueHP += robot.hp || 0;
-            }
+            if (robot.team === 'red') redHP += robot.hp || 0;
+            else if (robot.team === 'blue') blueHP += robot.hp || 0;
           }
         });
-
         this.$('redHP').textContent = Math.round(redHP);
         this.$('blueHP').textContent = Math.round(blueHP);
         this.$('aliveCount').textContent = alive;
       }
 
-      renderEvents(events) {
+      renderEvents(events){
         if (!events || !events.length) {
           this.$('events').textContent = 'Событий пока нет';
           return;
         }
-
         const recentEvents = events.slice(-8).reverse();
-        const eventNames = {
-          'fire': '🔥 Выстрел',
-          'hit': '🎯 Попадание', 
-          'death': '💀 Смерть',
-          'boundary_violation': '⚠️ За границей',
-          'laser_miss': '❌ Промах'
-        };
-
         const eventsHtml = recentEvents.map(event => {
-          const type = eventNames[event.type] || event.type;
+          const type = event.type || 'event';
           const robotId = event.robot_id || event.robot || '';
           const targetId = event.target_id ? ` → ${event.target_id}` : '';
-          const distance = (event.distance != null) ? ` • ${Number(event.distance).toFixed(1)}м` : '';
+          const distance = (event.distance != null) ? ` • d=${Number(event.distance).toFixed(2)}` : '';
           const success = event.success ? ' ✅' : (event.success === false ? ' ❌' : '');
-
           return `<div class="kv">
             <span>${type}${success}</span>
             <span class="mono">${robotId}${targetId}${distance}</span>
           </div>`;
         }).join('');
-
         this.$('events').innerHTML = eventsHtml;
       }
 
-      onClick(event) {
+      onClick(event){
         if (!this.renderer || !this.camera || !this.scene) return;
-
         const rect = this.renderer.domElement.getBoundingClientRect();
         const mouse = new THREE.Vector2(
           ((event.clientX - rect.left) / rect.width) * 2 - 1,
           -((event.clientY - rect.top) / rect.height) * 2 + 1
         );
-
         const raycaster = new THREE.Raycaster();
         raycaster.setFromCamera(mouse, this.camera);
-
         const robotGroups = Array.from(this.robots.values());
         const intersects = raycaster.intersectObjects(robotGroups, true);
-
         if (intersects.length > 0) {
           let targetGroup = intersects[0].object;
-
           while (targetGroup.parent && !this.robots.has(targetGroup.name)) {
             targetGroup = targetGroup.parent;
           }
-
           if (this.robots.has(targetGroup.name)) {
             this.selectRobot(targetGroup.name);
           }
@@ -1319,73 +909,52 @@
       }
 
       selectRobot(robotId) {
-        console.log('🎯 Выбран робот:', robotId);
-
-        this.robots.forEach(group => {
-          group.userData.selected = false;
-        });
-
+        this.robots.forEach(group => { group.userData.selected = false; });
         const robotGroup = this.robots.get(robotId);
         if (robotGroup) {
           robotGroup.userData.selected = true;
           this.followId = robotId;
-
           const frame = this.frames[this.cur];
           const robotData = frame?.robots?.find(r => r.id === robotId);
-
           if (robotData) {
-            const teamColor = robotData.team === 'red' ? '#ff5757' : '#5b8dff';
             const info = `
               <div class="kv"><span>ID</span><span class="mono">${robotData.id}</span></div>
-              <div class="kv"><span>Команда</span><span style="color: ${teamColor}">${robotData.team === 'red' ? 'Красная' : 'Синяя'}</span></div>
+              <div class="kv"><span>Команда</span><span style="color: ${robotData.team === 'red' ? '#ff5757' : '#5b8dff'}">${robotData.team}</span></div>
               <div class="kv"><span>HP</span><span>${Math.round(robotData.hp || 0)}/100</span></div>
               <div class="kv"><span>Позиция</span><span class="mono">[${robotData.x?.toFixed(1)}, ${robotData.y?.toFixed(1)}, ${robotData.z?.toFixed(1)}]</span></div>
               <div class="kv"><span>Жив</span><span>${robotData.alive ? '✅' : '❌'}</span></div>
               <div class="kv"><span>В границах</span><span>${robotData.within_bounds ? '✅' : '❌'}</span></div>
               <div class="kv"><span>Цель</span><span>${robotData.target_enemy}</span></div>
-              <div class="kv"><span>Стреляет</span><span>${robotData.fire_action ? '🔥' : '⭕'}</span></div>
-              <div class="kv"><span>Следование</span><span>ВКЛ</span></div>
+              <div class="kv"><span>Огонь</span><span>${robotData.fire_action ? '🔥' : '⭕'}</span></div>
+              <div class="kv"><span>Следование</span><span>ON</span></div>
             `;
             this.$('robotInfo').innerHTML = info;
           }
         }
       }
 
-      setCam(preset) {
-        if (!this.bounds || !this.camera) return;
-
+      setCam(preset){
+        if (!this.bounds || !this.camera || !this.controls) return;
         const centerX = (this.bounds.x_min + this.bounds.x_max) / 2;
         const centerY = (this.bounds.y_min + this.bounds.y_max) / 2;
         const centerZ = (this.bounds.z_min + this.bounds.z_max) / 2;
         const target = new THREE.Vector3(centerX, centerZ, centerY);
-
-        console.log('📷 Установка ракурса камеры:', preset);
-
         switch (preset) {
           case 'overview':
             this.camera.position.set(centerX + 20, centerZ + 16, centerY + 20);
-            if (this.controls) this.controls.target.copy(target);
-            this.followId = null;
-            break;
-
+            this.controls.target.copy(target); this.followId = null; break;
           case 'side':
             this.camera.position.set(centerX + 25, centerZ + 8, centerY);
-            if (this.controls) this.controls.target.copy(target);
-            this.followId = null;
-            break;
-
+            this.controls.target.copy(target); this.followId = null; break;
           case 'top':
             this.camera.position.set(centerX, centerZ + 30, centerY);
-            if (this.controls) this.controls.target.copy(target);
-            this.followId = null;
-            break;
-
+            this.controls.target.copy(target); this.followId = null; break;
           case 'follow':
             if (this.followId && this.robots.has(this.followId)) {
               const robotGroup = this.robots.get(this.followId);
               const offset = new THREE.Vector3(5, 4, 8);
               this.camera.position.copy(robotGroup.position).add(offset);
-              if (this.controls) this.controls.target.copy(robotGroup.position);
+              this.controls.target.copy(robotGroup.position);
             } else if (this.robots.size > 0) {
               const firstRobot = this.robots.values().next().value;
               this.followId = firstRobot.name;
@@ -1393,44 +962,70 @@
             }
             break;
         }
-
-        if (this.controls && this.controls.update) {
-          this.controls.update();
-        }
+        this.controls.update();
       }
 
-      play() {
+      play(){
         if (!this.frames.length || this.isPlay) return;
-
-        console.log('▶️ Запуск воспроизведения');
         this.isPlay = true;
-
         const step = () => {
           if (!this.isPlay) return;
-
           if (this.cur < this.frames.length - 1) {
-            this.cur++;
-            this.updateFrame(true);
-
+            this.cur++; this.updateFrame(true);
             const delay = Math.max(50, 150 / this.speed);
             setTimeout(step, delay);
           } else {
-            console.log('⏹️ Воспроизведение завершено');
             this.isPlay = false;
           }
         };
-
         step();
       }
 
-      pause() {
-        console.log('⏸️ Пауза воспроизведения');
-        this.isPlay = false;
-      }
+      pause(){ this.isPlay = false; }
 
-      reset() {
-        console.log('⟲ Сброс к первому кадру');
-        this.pause();
-        this.cur = 0;
-        this.updateFrame(true);
-        this.clearTrails();<!DOCTYPE html>
+      reset(){
+        this.pause(); this.cur = 0; this.updateFrame(true);
+        this.trails.clear();
+        this.trailsLines.forEach(line => { this.scene?.remove(line); line.geometry?.dispose(); });
+        this.trailsLines.clear();
+      }
+    }
+
+    window.addEventListener('load', () => {
+      console.log('🚀 Старт визуализатора…');
+      if (typeof THREE === 'undefined') {
+        console.error('❌ THREE.js не загружен');
+        document.getElementById('hint').textContent = 'Ошибка: THREE.js не загружен';
+        return;
+      }
+      window.visualizer = new Visualizer();
+      console.log('✅ Visualizer готов');
+    });
+
+    // Удобные хуки для отладки из консоли
+    window.debugVis = {
+      createTestRobot: () => {
+        if (window.visualizer && window.visualizer.scene) {
+          const testData = {
+            id: "test_robot", team: "red", x: 0, y: 0, z: 2, hp: 75, alive: true, within_bounds: true,
+            target_enemy: 0, move_action: [0.1, 0.0, 0.0], aim_action: [1.0, 0.0, 0.0], fire_action: false
+          };
+          const robot = window.visualizer.createRobotMesh(testData);
+          window.visualizer.scene.add(robot);
+          window.visualizer.robots.set("test_robot", robot);
+          window.visualizer.updateRobotMesh(robot, testData);
+          console.log('🤖 Тестовый робот создан');
+        }
+      },
+      logScene: () => {
+        if (window.visualizer && window.visualizer.scene) {
+          console.log('Children:', window.visualizer.scene.children.length);
+          console.log('Robots:', window.visualizer.robots.size);
+          console.log('Current frame:', window.visualizer.cur);
+          console.log('Total frames:', window.visualizer.frames.length);
+        }
+      }
+    };
+  </script>
+</body>
+</html>
