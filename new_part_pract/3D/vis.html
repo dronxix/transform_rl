@@ -5,29 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Arena 3D Battle Visualizer</title>
   <style>
-    :root{
-      --bg:#0b0f1a;--bg2:#0e1424;--panel:#121b30;--panel2:#0f1a33;
-      --text:#e5ecff;--muted:#94a3b8;--border:#1f2a44;--chip:#1b2540;
-    }
+    :root{ --bg:#0b0f1a;--bg2:#0e1424;--panel:#121b30;--panel2:#0f1a33; --text:#e5ecff;--muted:#94a3b8;--border:#1f2a44;--chip:#1b2540; }
     *{box-sizing:border-box}
     html,body{height:100%}
-    body{
-      margin:0;padding:0;background:linear-gradient(135deg,var(--bg),var(--bg2));color:var(--text);
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
-      overflow:hidden;
-    }
+    body{ margin:0;padding:0;background:linear-gradient(135deg,var(--bg),var(--bg2));color:var(--text);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif; overflow:hidden; }
     .wrap{display:flex;flex-direction:column;height:100%}
-    header{
-      padding:14px 18px;border-bottom:1px solid var(--border);
-      display:flex;gap:16px;align-items:center;justify-content:space-between;background:linear-gradient(180deg,#121b30,#0f1a33);
-      position:relative;z-index:2;
-    }
+    header{ padding:14px 18px;border-bottom:1px solid var(--border);
+      display:flex;gap:16px;align-items:center;justify-content:space-between;background:linear-gradient(180deg,#121b30,#0f1a33); position:relative;z-index:2; }
     header .ttl{display:flex;align-items:center;gap:10px}
     header h1{font-size:18px;margin:0;font-weight:700;letter-spacing:.3px}
     header .sub{font-size:12px;color:var(--muted)}
     .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    .btn{background:#1a2644;border:1px solid var(--border);color:var(--text);
-      padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600}
+    .btn{background:#1a2644;border:1px solid var(--border);color:var(--text); padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600}
     .btn:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.25)}
     .btn.ok{background:#11351f;border-color:#1b8a52}
     .btn.danger{background:#381417;border-color:#7a1d27}
@@ -39,16 +29,11 @@
     .layout{display:flex;flex:1 1 auto;min-height:0}
     .viewer{position:relative;flex:1 1 auto;min-width:0}
     #threejs-container{position:absolute;inset:0;z-index:1}
-    .overlay-hint{
-      position:absolute;left:50%;top:16px;transform:translateX(-50%);
-      background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px;
-      pointer-events:none;
-    }
+    .overlay-hint{ position:absolute;left:50%;top:16px;transform:translateX(-50%);
+      background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px; pointer-events:none; }
     .debug{position:absolute;top:50px;left:10px;background:rgba(0,0,0,0.8);color:#fff;padding:10px;border-radius:5px;font-size:12px;font-family:monospace}
-    aside{
-      width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,#121b30,#0f1a33);
-      display:flex;flex-direction:column;gap:12px;padding:12px;overflow:auto
-    }
+    aside{ width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,#121b30,#0f1a33);
+      display:flex;flex-direction:column;gap:12px;padding:12px;overflow:auto }
     .card{background:#0d142a;border:1px solid var(--border);border-radius:14px;padding:12px}
     .card h3{margin:0 0 6px;font-size:14px;letter-spacing:.3px}
     .row{display:flex;gap:10px}
@@ -73,18 +58,8 @@
       .viewer{height:60vh}
     }
   </style>
-
-  <!-- Импорт-карта: говорим браузеру, где лежит модуль "three" -->
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "./libs/three-r152/three.module.js"
-    }
-  }
-  </script>
 </head>
 <body>
-  <!-- Блокируем дефолтный drop/dragover -->
   <script>
     document.addEventListener('dragover', e => e.preventDefault(), false);
     document.addEventListener('drop', e => e.preventDefault(), false);
@@ -103,26 +78,16 @@
       <div class="controls">
         <button class="btn" id="btnLoad">📂 Загрузить JSON боя</button>
         <input type="file" id="fileInput" accept=".json" class="hidden"/>
-
         <button class="btn ok" id="btnPlay">▶ Пуск</button>
         <button class="btn" id="btnPause">⏸ Пауза</button>
         <button class="btn danger" id="btnReset">⟲ Сброс</button>
-
         <span class="speed">
           <span>Скорость:</span>
           <input type="range" id="speed" min="0.2" max="3" step="0.1" value="1"/>
           <span id="speedVal" class="chip mono">1.0x</span>
         </span>
-
-        <label class="tog">
-          <input type="checkbox" id="toggleTrails" checked/>
-          <span>Показывать следы</span>
-        </label>
-        <label class="tog">
-          <input type="checkbox" id="toggleBounds" checked/>
-          <span>Показывать границы</span>
-        </label>
-        
+        <label class="tog"><input type="checkbox" id="toggleTrails" checked/><span>Показывать следы</span></label>
+        <label class="tog"><input type="checkbox" id="toggleBounds" checked/><span>Показывать границы</span></label>
         <button class="btn warn" id="btnDebug">🐛 Отладка</button>
         <button class="btn" id="btnCreateDemo">🎮 Демо-данные</button>
       </div>
@@ -134,7 +99,6 @@
         <div class="overlay-hint muted mono" id="hint">Загрузите battle_3d_*.json или создайте демо-данные</div>
         <div class="debug hidden" id="debugInfo">
           Состояние:<br>
-          THREE.js: <span id="threeStatus">✅</span><br>
           Сцена: <span id="sceneStatus">❌</span><br>
           Данные: <span id="dataStatus">❌</span><br>
           Кадров: <span id="framesStatus">0</span><br>
@@ -144,37 +108,22 @@
 
       <aside>
         <div class="card drop" id="dropZone">📁 Перетащите JSON боя сюда или нажмите, чтобы выбрать файл</div>
-
         <div class="card">
           <h3>📊 Статистика боя</h3>
           <div class="row">
-            <div class="stat red">
-              <div>HP команды Red</div>
-              <div class="v" id="redHP">0</div>
-            </div>
-            <div class="stat blue">
-              <div>HP команды Blue</div>
-              <div class="v" id="blueHP">0</div>
-            </div>
+            <div class="stat red"><div>HP команды Red</div><div class="v" id="redHP">0</div></div>
+            <div class="stat blue"><div>HP команды Blue</div><div class="v" id="blueHP">0</div></div>
           </div>
           <div class="row" style="margin-top:8px">
-            <div class="stat">
-              <div>Живы</div>
-              <div class="v" id="aliveCount">0</div>
-            </div>
-            <div class="stat">
-              <div>Время</div>
-              <div class="v" id="battleTime">0s</div>
-            </div>
+            <div class="stat"><div>Живы</div><div class="v" id="aliveCount">0</div></div>
+            <div class="stat"><div>Время</div><div class="v" id="battleTime">0s</div></div>
           </div>
         </div>
-
         <div class="card timeline">
           <h3>⏰ Шкала времени</h3>
           <input type="range" id="frame" min="0" max="0" value="0"/>
           <div class="kv"><span>Кадр: <span id="cur">0</span></span><span>Всего: <span id="tot">0</span></span></div>
         </div>
-
         <div class="card">
           <h3>📷 Камера</h3>
           <div class="grid">
@@ -183,16 +132,12 @@
             <button class="btn" data-cam="top">⬇️ Сверху</button>
             <button class="btn" data-cam="follow">🎯 Следовать</button>
           </div>
-          <div class="muted" style="margin-top:8px">
-            🖱️ Вращение/Зум • ⤢ Правая кнопка: Панорама
-          </div>
+          <div class="muted" style="margin-top:8px">🖱️ Вращение/Зум • ⤢ Правая кнопка: Панорама</div>
         </div>
-
         <div class="card">
           <h3>🤖 Информация о роботе</h3>
           <div id="robotInfo" class="robot-info">Кликните по роботу, чтобы увидеть детали</div>
         </div>
-
         <div class="card">
           <h3>🎞️ Последние события</h3>
           <div id="events" class="robot-info">Событий пока нет</div>
@@ -201,12 +146,11 @@
     </div>
   </div>
 
-  <!-- Весь код — в модульном скрипте -->
+  <!-- МОДУЛЬНЫЙ СКРИПТ С ПРЯМЫМИ ПУТЯМИ -->
   <script type="module">
-    import * as THREE from 'three';
+    import * as THREE from './libs/three-r152/build/three.module.js';
     import { OrbitControls } from './libs/three-r152/examples/jsm/controls/OrbitControls.js';
 
-    // Глобальный флаг отладки
     window.debugMode = false;
 
     class Visualizer {
@@ -286,9 +230,7 @@
         const drop =this.$('dropZone');
         
         input.onchange=(e)=>{ 
-          if(e.target.files && e.target.files[0]) {
-            this.loadFile(e.target.files[0]); 
-          }
+          if(e.target.files && e.target.files[0]) this.loadFile(e.target.files[0]); 
         };
         
         drop.addEventListener('click',()=>input.click());
@@ -306,9 +248,7 @@
           const txt = await file.text();
           const json = JSON.parse(txt);
           this.ingest(json);
-        } catch(e) { 
-          alert('Не удалось загрузить файл: ' + e.message); 
-        }
+        } catch(e) { alert('Не удалось загрузить файл: ' + e.message); }
       }
 
       createDemoData() {
@@ -385,7 +325,6 @@
         this.$('dataStatus').textContent = '✅';
       }
 
-      /* =============== 3D =============== */
       init3D(){
         const cont = this.$('threejs-container');
 
@@ -822,14 +761,11 @@
       window.visualizer = new Visualizer();
     });
 
-    // Отладка из консоли
     window.debugVis = {
       createTestRobot: () => {
         const v = window.visualizer; if (!v || !v.scene) return;
-        const testData = {
-          id:"test_robot", team:"red", x:0, y:0, z:2, hp:75, alive:true, within_bounds:true,
-          target_enemy:0, move_action:[0.1,0.0,0.0], aim_action:[1.0,0.0,0.0], fire_action:false
-        };
+        const testData = { id:"test_robot", team:"red", x:0, y:0, z:2, hp:75, alive:true, within_bounds:true,
+          target_enemy:0, move_action:[0.1,0.0,0.0], aim_action:[1.0,0.0,0.0], fire_action:false };
         const robot = v.createRobotMesh(testData);
         v.scene.add(robot); v.robots.set("test_robot", robot);
         v.updateRobotMesh(robot, testData);
