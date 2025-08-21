@@ -7,8 +7,7 @@
   <style>
     :root{
       --bg:#0b0f1a;--bg2:#0e1424;--panel:#121b30;--panel2:#0f1a33;
-      --accent:#2dd4bf;--accent2:#8b5cf6;--text:#e5ecff;--muted:#94a3b8;--danger:#ef4444;--ok:#22c55e;--warn:#f59e0b;
-      --border:#1f2a44;--chip:#1b2540;
+      --text:#e5ecff;--muted:#94a3b8;--border:#1f2a44;--chip:#1b2540;
     }
     *{box-sizing:border-box}
     html,body{height:100%}
@@ -20,22 +19,19 @@
     .wrap{display:flex;flex-direction:column;height:100%}
     header{
       padding:14px 18px;border-bottom:1px solid var(--border);
-      display:flex;gap:16px;align-items:center;justify-content:space-between;background:linear-gradient(180deg,var(--panel),var(--panel2));
+      display:flex;gap:16px;align-items:center;justify-content:space-between;background:linear-gradient(180deg,#121b30,#0f1a33);
       position:relative;z-index:2;
     }
     header .ttl{display:flex;align-items:center;gap:10px}
     header h1{font-size:18px;margin:0;font-weight:700;letter-spacing:.3px}
     header .sub{font-size:12px;color:var(--muted)}
     .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    .btn{
-      background:#1a2644;border:1px solid var(--border);color:var(--text);
-      padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600
-    }
+    .btn{background:#1a2644;border:1px solid var(--border);color:var(--text);
+      padding:8px 12px;border-radius:10px;cursor:pointer;transition:all .15s ease;font-weight:600}
     .btn:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.25)}
-    .btn.primary{background:linear-gradient(135deg,#1f8a81,#2563eb);border-color:#2563eb}
-    .btn.warn{background:#3a2a14;border-color:#7c4a00}
     .btn.ok{background:#11351f;border-color:#1b8a52}
     .btn.danger{background:#381417;border-color:#7a1d27}
+    .btn.warn{background:#3a2a14;border-color:#7c4a00}
     .chip{background:var(--chip);border:1px solid var(--border);padding:6px 10px;border-radius:999px;font-size:12px}
     .tog{display:flex;align-items:center;gap:8px}
     .tog input{transform:scale(1.2)}
@@ -43,15 +39,14 @@
     .layout{display:flex;flex:1 1 auto;min-height:0}
     .viewer{position:relative;flex:1 1 auto;min-width:0}
     #threejs-container{position:absolute;inset:0;z-index:1}
-    /* важно: канвас не перехватывается оверлеями и принимает жесты */
     .overlay-hint{
       position:absolute;left:50%;top:16px;transform:translateX(-50%);
       background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px;
-      pointer-events:none; /* ключ, чтобы не ломать управление камерой */
+      pointer-events:none;
     }
     .debug{position:absolute;top:50px;left:10px;background:rgba(0,0,0,0.8);color:#fff;padding:10px;border-radius:5px;font-size:12px;font-family:monospace}
     aside{
-      width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,var(--panel),var(--panel2));
+      width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,#121b30,#0f1a33);
       display:flex;flex-direction:column;gap:12px;padding:12px;overflow:auto
     }
     .card{background:#0d142a;border:1px solid var(--border);border-radius:14px;padding:12px}
@@ -70,7 +65,6 @@
     .muted{color:var(--muted)}
     .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
     .hidden{display:none !important}
-    /* канвас: гарантированный приём событий колеса и фокус */
     canvas{display:block;outline:none}
     @media (max-width: 1000px){aside{width:280px}}
     @media (max-width: 860px){
@@ -79,9 +73,18 @@
       .viewer{height:60vh}
     }
   </style>
+
+  <!-- Импорт-карта: говорим браузеру, где лежит модуль "three" -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./libs/three-r152/three.module.js"
+    }
+  }
+  </script>
 </head>
 <body>
-  <!-- Блокируем дефолтный drop/dragover, чтобы браузер не открывал JSON как текст -->
+  <!-- Блокируем дефолтный drop/dragover -->
   <script>
     document.addEventListener('dragover', e => e.preventDefault(), false);
     document.addEventListener('drop', e => e.preventDefault(), false);
@@ -131,7 +134,7 @@
         <div class="overlay-hint muted mono" id="hint">Загрузите battle_3d_*.json или создайте демо-данные</div>
         <div class="debug hidden" id="debugInfo">
           Состояние:<br>
-          THREE.js: <span id="threeStatus">❌</span><br>
+          THREE.js: <span id="threeStatus">✅</span><br>
           Сцена: <span id="sceneStatus">❌</span><br>
           Данные: <span id="dataStatus">❌</span><br>
           Кадров: <span id="framesStatus">0</span><br>
@@ -198,29 +201,16 @@
     </div>
   </div>
 
-  <!-- THREE.js: основная библиотека -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
-  <!-- Пытаемся загрузить нон-модуль OrbitControls (для глобального THREE) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/examples/js/controls/OrbitControls.js"></script>
+  <!-- Весь код — в модульном скрипте -->
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from './libs/three-r152/examples/jsm/controls/OrbitControls.js';
 
-  <script>
     // Глобальный флаг отладки
     window.debugMode = false;
 
-    // Надёжная подгрузка скриптов (fallback для OrbitControls)
-    function loadScript(src){
-      return new Promise((resolve, reject)=>{
-        const s=document.createElement('script');
-        s.src=src;
-        s.onload=resolve;
-        s.onerror=reject;
-        document.head.appendChild(s);
-      });
-    }
-
     class Visualizer {
       constructor(){
-        console.log('🎮 Инициализация Arena 3D Visualizer...');
         this.data=null; this.frames=[]; this.bounds=null; this.laser=null;
         this.cur=0; this.isPlay=false; this.speed=1; this.showBounds=true; this.showTrails=true;
         this.recent=[]; this.robots=new Map(); this.trails=new Map(); this.trailsLines=new Map(); this.followId=null;
@@ -228,56 +218,11 @@
         this.$=id=>document.getElementById(id);
         this.hookUI();
         this.hookFile();
-        this.checkThreeJS();
-
-        // ВАЖНО: ждём гарантированного наличия OrbitControls
-        this.ensureThreeAndControls().then(()=>{
-          this.init3D();
-        }).catch(err=>{
-          console.error('❌ Не удалось подготовить THREE/OrbitControls:', err);
-          this.$('hint').textContent = 'Ошибка загрузки THREE/OrbitControls. Проверьте интернет-соединение.';
-        });
-      }
-
-      async ensureThreeAndControls(){
-        if (typeof THREE === 'undefined') {
-          throw new Error('THREE не загружен');
-        }
-        if (typeof THREE.OrbitControls === 'undefined') {
-          console.warn('⚠️ OrbitControls не найден. Загружаю fallback с unpkg…');
-          try {
-            await loadScript('https://unpkg.com/three@0.152.2/examples/js/controls/OrbitControls.js');
-            console.log('✅ OrbitControls загружен с unpkg');
-          } catch(e){
-            console.error('❌ Не удалось загрузить OrbitControls:', e);
-            throw e;
-          }
-        }
-      }
-
-      checkThreeJS() {
-        const status = this.$('threeStatus');
-        if (typeof THREE !== 'undefined') {
-          console.log('✅ THREE.js загружен');
-          status.textContent = '✅';
-          status.style.color = '#22c55e';
-
-          if (typeof THREE.OrbitControls !== 'undefined') {
-            console.log('✅ OrbitControls обнаружен');
-          } else {
-            console.warn('⚠️ OrbitControls пока нет (будет догружен)');
-          }
-        } else {
-          console.error('❌ THREE.js не загружен');
-          status.textContent = '❌ THREE.js не загружен';
-          status.style.color = '#ef4444';
-          this.$('hint').textContent = 'Ошибка: THREE.js не загружен. Проверьте интернет-соединение.';
-        }
+        this.init3D();
       }
 
       updateDebugStatus() {
         if (!window.debugMode) return;
-        this.$('threeStatus').textContent = typeof THREE !== 'undefined' ? '✅' : '❌';
         this.$('sceneStatus').textContent = this.scene ? '✅' : '❌';
         this.$('dataStatus').textContent = this.data ? '✅' : '❌';
         this.$('framesStatus').textContent = this.frames.length;
@@ -300,10 +245,7 @@
         this.$('toggleTrails').addEventListener('change',e=>{
           this.showTrails=e.target.checked;
           if (!this.showTrails) {
-            this.trailsLines.forEach(line => {
-              this.scene?.remove(line);
-              line.geometry?.dispose();
-            });
+            this.trailsLines.forEach(line => { this.scene?.remove(line); line.geometry?.dispose(); });
             this.trailsLines.clear();
             this.trails.clear();
           }
@@ -345,7 +287,6 @@
         
         input.onchange=(e)=>{ 
           if(e.target.files && e.target.files[0]) {
-            console.log('📁 Файл выбран:', e.target.files[0].name);
             this.loadFile(e.target.files[0]); 
           }
         };
@@ -356,29 +297,21 @@
         drop.addEventListener('drop',e=>{
           e.preventDefault(); drop.classList.remove('drag');
           const f=e.dataTransfer.files && e.dataTransfer.files[0]; 
-          if(f) {
-            console.log('📁 Файл сброшен:', f.name);
-            this.loadFile(f);
-          }
+          if(f) this.loadFile(f);
         });
       }
 
       async loadFile(file){
         try {
-          console.log('📖 Чтение файла…');
           const txt = await file.text();
-          console.log('📊 Парсинг JSON…');
           const json = JSON.parse(txt);
-          console.log('✅ JSON распарсен, кадров:', json.frames?.length || 0);
           this.ingest(json);
         } catch(e) { 
-          console.error('❌ Ошибка загрузки файла:', e);
           alert('Не удалось загрузить файл: ' + e.message); 
         }
       }
 
       createDemoData() {
-        console.log('🎮 Создание демо-данных…');
         const demoData = {
           battle_id: "demo_battle_3d",
           start_time: Date.now() / 1000,
@@ -401,94 +334,38 @@
             events: [],
             global_state: {},
             robots: [
-              {
-                id: "red_0",
-                team: "red",
-                x: -5 + Math.sin(i * 0.1) * 2,
-                y: -2 + Math.cos(i * 0.15) * 1.5,
-                z: 2 + Math.sin(i * 0.2) * 1,
-                hp: Math.max(0, 100 - i * 1.5),
-                alive: 100 - i * 1.5 > 0,
-                within_bounds: true,
-                target_enemy: 0,
-                move_action: [0.1, 0.05, 0.02],
-                aim_action: [0.2, -0.1, 0.0],
-                fire_action: i % 10 === 0,
-                laser_range: 8.0,
-                can_shoot_targets: ["blue_0", "blue_1"]
-              },
-              {
-                id: "red_1", 
-                team: "red",
-                x: -3 + Math.cos(i * 0.12) * 1.5,
-                y: 1 + Math.sin(i * 0.18) * 2,
-                z: 1.5 + Math.cos(i * 0.25) * 0.8,
-                hp: Math.max(0, 100 - i * 1.2),
-                alive: 100 - i * 1.2 > 0,
-                within_bounds: true,
-                target_enemy: 1,
-                move_action: [-0.05, 0.1, -0.01],
-                aim_action: [-0.15, 0.2, 0.05],
-                fire_action: i % 8 === 0,
-                laser_range: 8.0,
-                can_shoot_targets: ["blue_0"]
-              },
-              {
-                id: "blue_0",
-                team: "blue",
-                x: 5 + Math.sin(i * 0.11) * -1.8,
-                y: 2 + Math.cos(i * 0.16) * -1.2,
-                z: 2.5 + Math.sin(i * 0.22) * 0.9,
-                hp: Math.max(0, 100 - i * 2.0),
-                alive: 100 - i * 2.0 > 0,
-                within_bounds: true,
-                target_enemy: 0,
-                move_action: [-0.1, -0.08, 0.03],
-                aim_action: [-0.25, 0.15, -0.02],
-                fire_action: i % 12 === 0,
-                laser_range: 8.0,
-                can_shoot_targets: ["red_0", "red_1"]
-              },
-              {
-                id: "blue_1",
-                team: "blue", 
-                x: 3 + Math.cos(i * 0.13) * -2.2,
-                y: -1 + Math.sin(i * 0.14) * -1.8,
-                z: 1.8 + Math.cos(i * 0.28) * 1.1,
-                hp: Math.max(0, 100 - i * 1.8),
-                alive: 100 - i * 1.8 > 0,
-                within_bounds: true,
-                target_enemy: 1,
-                move_action: [0.08, -0.12, -0.02],
-                aim_action: [0.18, -0.22, 0.08],
-                fire_action: i % 15 === 0,
-                laser_range: 8.0,
-                can_shoot_targets: ["red_1"]
-              }
+              { id:"red_0",team:"red",
+                x:-5+Math.sin(i*0.1)*2, y:-2+Math.cos(i*0.15)*1.5, z:2+Math.sin(i*0.2)*1,
+                hp:Math.max(0,100-i*1.5), alive:100-i*1.5>0, within_bounds:true,
+                target_enemy:0, move_action:[0.1,0.05,0.02], aim_action:[0.2,-0.1,0.0],
+                fire_action: i%10===0, laser_range:8.0, can_shoot_targets:["blue_0","blue_1"] },
+              { id:"red_1",team:"red",
+                x:-3+Math.cos(i*0.12)*1.5, y:1+Math.sin(i*0.18)*2, z:1.5+Math.cos(i*0.25)*0.8,
+                hp:Math.max(0,100-i*1.2), alive:100-i*1.2>0, within_bounds:true,
+                target_enemy:1, move_action:[-0.05,0.1,-0.01], aim_action:[-0.15,0.2,0.05],
+                fire_action: i%8===0, laser_range:8.0, can_shoot_targets:["blue_0"] },
+              { id:"blue_0",team:"blue",
+                x:5+Math.sin(i*0.11)*-1.8, y:2+Math.cos(i*0.16)*-1.2, z:2.5+Math.sin(i*0.22)*0.9,
+                hp:Math.max(0,100-i*2.0), alive:100-i*2.0>0, within_bounds:true,
+                target_enemy:0, move_action:[-0.1,-0.08,0.03], aim_action:[-0.25,0.15,-0.02],
+                fire_action: i%12===0, laser_range:8.0, can_shoot_targets:["red_0","red_1"] },
+              { id:"blue_1",team:"blue",
+                x:3+Math.cos(i*0.13)*-2.2, y:-1+Math.sin(i*0.14)*-1.8, z:1.8+Math.cos(i*0.28)*1.1,
+                hp:Math.max(0,100-i*1.8), alive:100-i*1.8>0, within_bounds:true,
+                target_enemy:1, move_action:[0.08,-0.12,-0.02], aim_action:[0.18,-0.22,0.08],
+                fire_action: i%15===0, laser_range:8.0, can_shoot_targets:["red_1"] }
             ]
           };
-
           if (i % 10 === 0) {
-            frame.events.push({
-              type: "fire",
-              timestamp: frame.timestamp,
-              robot_id: "red_0",
-              target_id: "blue_0",
-              position: [frame.robots[0].x, frame.robots[0].y, frame.robots[0].z],
-              distance: 8.5,
-              success: true
-            });
+            frame.events.push({type:"fire",timestamp:frame.timestamp,robot_id:"red_0",target_id:"blue_0",
+              position:[frame.robots[0].x,frame.robots[0].y,frame.robots[0].z],distance:8.5,success:true});
           }
-
           demoData.frames.push(frame);
         }
-
-        console.log('✅ Демо-данные созданы, кадров:', demoData.frames.length);
         this.ingest(demoData);
       }
 
       ingest(json){
-        console.log('📥 Приём данных боя…');
         this.data = json;
         this.frames = Array.isArray(json.frames) ? json.frames : [];
         this.bounds = json.field_bounds || (this.frames[0]?.field_bounds) || {x_min:-10,x_max:10,y_min:-8,y_max:8,z_min:0,z_max:6};
@@ -500,118 +377,86 @@
 
         this.robots.clear();
         this.trails.clear();
-        this.trailsLines.forEach(line => {
-          this.scene?.remove(line);
-          line.geometry?.dispose();
-        });
+        this.trailsLines.forEach(line => { this.scene?.remove(line); line.geometry?.dispose(); });
         this.trailsLines.clear();
 
-        if (!this.scene && typeof THREE !== 'undefined') {
-          console.log('🎬 Создаю 3D сцену (поздняя инициализация)…');
-          this.init3D();
-        }
         if (this.scene) this.updateField();
-        
-        this.pause(); 
-        this.cur = 0; 
-        this.updateFrame(true);
-        console.log('✅ Данные боя загружены');
+        this.pause(); this.cur = 0; this.updateFrame(true);
+        this.$('dataStatus').textContent = '✅';
       }
 
       /* =============== 3D =============== */
       init3D(){
-        if (typeof THREE === 'undefined') {
-          console.error('❌ THREE.js не загружен');
-          return;
-        }
-        try {
-          console.log('🎬 Инициализация 3D…');
-          const cont = this.$('threejs-container');
+        const cont = this.$('threejs-container');
 
-          this.scene = new THREE.Scene();
-          this.scene.fog = new THREE.Fog(0x0b1020, 30, 80);
+        this.scene = new THREE.Scene();
+        this.scene.fog = new THREE.Fog(0x0b1020, 30, 80);
 
-          const w=cont.clientWidth||800, h=cont.clientHeight||600;
-          this.camera = new THREE.PerspectiveCamera(60, w/h, 0.1, 500);
-          this.camera.position.set(18, 14, 18);
+        const w=cont.clientWidth||800, h=cont.clientHeight||600;
+        this.camera = new THREE.PerspectiveCamera(60, w/h, 0.1, 500);
+        this.camera.position.set(18, 14, 18);
 
-          this.renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
-          this.renderer.setPixelRatio(window.devicePixelRatio||1);
-          this.renderer.setSize(w,h);
-          this.renderer.setClearColor(0x071019,1);
-          this.renderer.shadowMap.enabled = true;
-          this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-          cont.innerHTML='';
-          cont.appendChild(this.renderer.domElement);
+        this.renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
+        this.renderer.setPixelRatio(window.devicePixelRatio||1);
+        this.renderer.setSize(w,h);
+        this.renderer.setClearColor(0x071019,1);
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        cont.innerHTML='';
+        cont.appendChild(this.renderer.domElement);
 
-          // Ключевые настройки для стабильного управления
-          this.renderer.domElement.style.touchAction = 'none'; // жесты/тач
-          this.renderer.domElement.tabIndex = 0;               // фокус для колеса мыши
-          this.renderer.domElement.addEventListener('contextmenu', e=> e.preventDefault()); // пэн правой кнопкой без меню
+        this.renderer.domElement.style.touchAction = 'none';
+        this.renderer.domElement.tabIndex = 0;
+        this.renderer.domElement.addEventListener('contextmenu', e=> e.preventDefault());
 
-          // OrbitControls
-          if (typeof THREE.OrbitControls !== 'undefined') {
-            this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
-            this.controls.enableDamping=true; 
-            this.controls.dampingFactor=.08;
-            this.controls.minDistance=4; 
-            this.controls.maxDistance=80;
-            this.controls.maxPolarAngle = Math.PI * 0.9;
-            this.controls.enableRotate = true;
-            this.controls.enablePan = true;
-            this.controls.enableZoom = true;
-          } else {
-            console.warn('⚠️ OrbitControls недоступен даже после догрузки');
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping=true; 
+        this.controls.dampingFactor=.08;
+        this.controls.minDistance=4; 
+        this.controls.maxDistance=80;
+        this.controls.maxPolarAngle = Math.PI * 0.9;
+
+        const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+        this.scene.add(ambient);
+        
+        const directional = new THREE.DirectionalLight(0xffffff, 0.8);
+        directional.position.set(16, 24, 12);
+        directional.castShadow = true;
+        directional.shadow.mapSize.width = 2048;
+        directional.shadow.mapSize.height = 2048;
+        this.scene.add(directional);
+
+        this.fieldGroup = new THREE.Group();
+        this.scene.add(this.fieldGroup);
+        this.buildField();
+
+        this.renderer.domElement.addEventListener('click', e => this.onClick(e));
+
+        const onResize = () => {
+          const w = cont.clientWidth, h = cont.clientHeight;
+          this.camera.aspect = w / h;
+          this.camera.updateProjectionMatrix();
+          this.renderer.setSize(w, h);
+        };
+        window.addEventListener('resize', onResize);
+
+        const animate = () => {
+          requestAnimationFrame(animate);
+          this.controls.update();
+          if (this.showTrails && this.trails.size) this.updateTrails();
+
+          if (this.followId && this.robots.has(this.followId)) {
+            const robotGroup = this.robots.get(this.followId);
+            const offset = new THREE.Vector3(4, 3, 6);
+            const targetPos = robotGroup.position.clone().add(offset);
+            this.camera.position.lerp(targetPos, 0.05);
+            this.controls.target.lerp(robotGroup.position, 0.1);
           }
+          this.renderer.render(this.scene, this.camera);
+        };
+        animate();
 
-          const ambient = new THREE.AmbientLight(0xffffff, 0.4);
-          this.scene.add(ambient);
-          
-          const directional = new THREE.DirectionalLight(0xffffff, 0.8);
-          directional.position.set(16, 24, 12);
-          directional.castShadow = true;
-          directional.shadow.mapSize.width = 2048;
-          directional.shadow.mapSize.height = 2048;
-          this.scene.add(directional);
-
-          this.fieldGroup = new THREE.Group();
-          this.scene.add(this.fieldGroup);
-          this.buildField();
-
-          this.renderer.domElement.addEventListener('click', e => this.onClick(e));
-
-          const onResize = () => {
-            const w = cont.clientWidth, h = cont.clientHeight;
-            this.camera.aspect = w / h;
-            this.camera.updateProjectionMatrix();
-            this.renderer.setSize(w, h);
-          };
-          window.addEventListener('resize', onResize);
-
-          const animate = () => {
-            requestAnimationFrame(animate);
-            if (this.controls) this.controls.update();
-            if (this.showTrails && this.trails.size) this.updateTrails();
-
-            if (this.followId && this.robots.has(this.followId)) {
-              const robotGroup = this.robots.get(this.followId);
-              const offset = new THREE.Vector3(4, 3, 6);
-              const targetPos = robotGroup.position.clone().add(offset);
-              this.camera.position.lerp(targetPos, 0.05);
-              if (this.controls) this.controls.target.lerp(robotGroup.position, 0.1);
-            }
-            this.renderer.render(this.scene, this.camera);
-          };
-          animate();
-
-          this.$('sceneStatus').textContent = '✅';
-          this.$('sceneStatus').style.color = '#22c55e';
-          console.log('✅ 3D инициализировано');
-          
-        } catch (error) {
-          console.error('❌ Ошибка инициализации 3D:', error);
-          this.$('hint').textContent = '3D инициализация не удалась: ' + error.message;
-        }
+        this.$('sceneStatus').textContent = '✅';
       }
 
       buildField(){
@@ -673,7 +518,6 @@
         if (this.fieldGroup && this.bounds) this.buildField();
       }
 
-      /* ============ Кадры/Роботы ============ */
       createRobotMesh(data){
         const group = new THREE.Group(); group.name = data.id;
 
@@ -715,15 +559,7 @@
         const label = new THREE.Mesh(labelGeometry, labelMaterial);
         label.position.set(0, 1.6, 0); label.name = 'label'; group.add(label);
 
-        group.userData = { 
-          selected: false,
-          team: data.team,
-          originalColors: {
-            body: bodyMaterial.color.clone(),
-            head: headMaterial.color.clone(),
-            gun: gunMaterial.color.clone()
-          }
-        };
+        group.userData = { selected:false, team:data.team };
         return group;
       }
 
@@ -783,8 +619,8 @@
         const laserMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.8 });
         const laser = new THREE.Mesh(laserGeometry, laserMaterial);
         laser.position.copy(position); laser.position.y += 0.4;
-        const [aimX, aimY, aimZ] = aimDirection;
-        const direction = new THREE.Vector3(aimX || 1, aimY || 0, aimZ || 0).normalize();
+        const [aimX, aimY, aimZ] = aimDirection || [1,0,0];
+        const direction = new THREE.Vector3(aimX, aimY, aimZ).normalize();
         laser.lookAt(laser.position.clone().add(direction)); laser.rotateX(Math.PI / 2);
         this.scene.add(laser);
         let opacity = 0.8;
@@ -844,10 +680,7 @@
         const currentTime = (frame.timestamp || 0) - startTime;
         this.$('battleTime').textContent = (currentTime > 0 ? currentTime.toFixed(1) : '0') + 's';
 
-        if (syncSlider) {
-          this.$('cur').textContent = this.cur;
-          this.$('frame').value = this.cur;
-        }
+        if (syncSlider) { this.$('cur').textContent = this.cur; this.$('frame').value = this.cur; }
         this.renderEvents(frame.events || []);
         this.updateDebugStatus();
       }
@@ -872,22 +705,18 @@
           return;
         }
         const recentEvents = events.slice(-8).reverse();
-        const eventsHtml = recentEvents.map(event => {
+        const html = recentEvents.map(event => {
           const type = event.type || 'event';
           const robotId = event.robot_id || event.robot || '';
           const targetId = event.target_id ? ` → ${event.target_id}` : '';
           const distance = (event.distance != null) ? ` • d=${Number(event.distance).toFixed(2)}` : '';
           const success = event.success ? ' ✅' : (event.success === false ? ' ❌' : '');
-          return `<div class="kv">
-            <span>${type}${success}</span>
-            <span class="mono">${robotId}${targetId}${distance}</span>
-          </div>`;
+          return `<div class="kv"><span>${type}${success}</span><span class="mono">${robotId}${targetId}${distance}</span></div>`;
         }).join('');
-        this.$('events').innerHTML = eventsHtml;
+        this.$('events').innerHTML = html;
       }
 
       onClick(event){
-        if (!this.renderer || !this.camera || !this.scene) return;
         const rect = this.renderer.domElement.getBoundingClientRect();
         const mouse = new THREE.Vector2(
           ((event.clientX - rect.left) / rect.width) * 2 - 1,
@@ -974,9 +803,7 @@
             this.cur++; this.updateFrame(true);
             const delay = Math.max(50, 150 / this.speed);
             setTimeout(step, delay);
-          } else {
-            this.isPlay = false;
-          }
+          } else { this.isPlay = false; }
         };
         step();
       }
@@ -992,38 +819,27 @@
     }
 
     window.addEventListener('load', () => {
-      console.log('🚀 Старт визуализатора…');
-      if (typeof THREE === 'undefined') {
-        console.error('❌ THREE.js не загружен');
-        document.getElementById('hint').textContent = 'Ошибка: THREE.js не загружен';
-        return;
-      }
       window.visualizer = new Visualizer();
-      console.log('✅ Visualizer готов');
     });
 
-    // Удобные хуки для отладки из консоли
+    // Отладка из консоли
     window.debugVis = {
       createTestRobot: () => {
-        if (window.visualizer && window.visualizer.scene) {
-          const testData = {
-            id: "test_robot", team: "red", x: 0, y: 0, z: 2, hp: 75, alive: true, within_bounds: true,
-            target_enemy: 0, move_action: [0.1, 0.0, 0.0], aim_action: [1.0, 0.0, 0.0], fire_action: false
-          };
-          const robot = window.visualizer.createRobotMesh(testData);
-          window.visualizer.scene.add(robot);
-          window.visualizer.robots.set("test_robot", robot);
-          window.visualizer.updateRobotMesh(robot, testData);
-          console.log('🤖 Тестовый робот создан');
-        }
+        const v = window.visualizer; if (!v || !v.scene) return;
+        const testData = {
+          id:"test_robot", team:"red", x:0, y:0, z:2, hp:75, alive:true, within_bounds:true,
+          target_enemy:0, move_action:[0.1,0.0,0.0], aim_action:[1.0,0.0,0.0], fire_action:false
+        };
+        const robot = v.createRobotMesh(testData);
+        v.scene.add(robot); v.robots.set("test_robot", robot);
+        v.updateRobotMesh(robot, testData);
       },
       logScene: () => {
-        if (window.visualizer && window.visualizer.scene) {
-          console.log('Children:', window.visualizer.scene.children.length);
-          console.log('Robots:', window.visualizer.robots.size);
-          console.log('Current frame:', window.visualizer.cur);
-          console.log('Total frames:', window.visualizer.frames.length);
-        }
+        const v = window.visualizer; if (!v || !v.scene) return;
+        console.log('Children:', v.scene.children.length);
+        console.log('Robots:', v.robots.size);
+        console.log('Current frame:', v.cur);
+        console.log('Total frames:', v.frames.length);
       }
     };
   </script>
