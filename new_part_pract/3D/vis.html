@@ -31,7 +31,6 @@
     #threejs-container{position:absolute;inset:0;z-index:1}
     .overlay-hint{ position:absolute;left:50%;top:16px;transform:translateX(-50%);
       background:#0f172a88;padding:8px 12px;border:1px solid var(--border);border-radius:10px;font-size:12px; pointer-events:none; }
-    .debug{position:absolute;top:50px;left:10px;background:rgba(0,0,0,0.8);color:#fff;padding:10px;border-radius:5px;font-size:12px;font-family:monospace}
     aside{ width:320px;max-width:35vw;border-left:1px solid var(--border);background:linear-gradient(180deg,#121b30,#0f1a33);
       display:flex;flex-direction:column;gap:12px;padding:12px;overflow:auto }
     .card{background:#0d142a;border:1px solid var(--border);border-radius:14px;padding:12px}
@@ -71,7 +70,7 @@
         <div style="font-size:20px">🛰️</div>
         <div>
           <h1>Arena 3D Battle Visualizer</h1>
-          <div class="sub">3D-визуализация боёв с границами поля и радиусом лазера</div>
+          <div class="sub">3D-визуализация боёв с лазерными снарядами и баллистикой</div>
         </div>
       </div>
 
@@ -88,7 +87,7 @@
         </span>
         <label class="tog"><input type="checkbox" id="toggleTrails" checked/><span>Показывать следы</span></label>
         <label class="tog"><input type="checkbox" id="toggleBounds" checked/><span>Показывать границы</span></label>
-        <button class="btn warn" id="btnDebug">🐛 Отладка</button>
+        <label class="tog"><input type="checkbox" id="toggleProjectiles" checked/><span>Лазерные снаряды</span></label>
         <button class="btn" id="btnCreateDemo">🎮 Демо-данные</button>
       </div>
     </header>
@@ -97,13 +96,6 @@
       <section class="viewer">
         <div id="threejs-container"></div>
         <div class="overlay-hint muted mono" id="hint">Загрузите battle_3d_*.json или создайте демо-данные</div>
-        <div class="debug hidden" id="debugInfo">
-          Состояние:<br>
-          Сцена: <span id="sceneStatus">❌</span><br>
-          Данные: <span id="dataStatus">❌</span><br>
-          Кадров: <span id="framesStatus">0</span><br>
-          Текущий: <span id="currentStatus">0</span>
-        </div>
       </section>
 
       <aside>
@@ -117,6 +109,10 @@
           <div class="row" style="margin-top:8px">
             <div class="stat"><div>Живы</div><div class="v" id="aliveCount">0</div></div>
             <div class="stat"><div>Время</div><div class="v" id="battleTime">0s</div></div>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <div class="stat"><div>Выстрелов</div><div class="v" id="shotsFired">0</div></div>
+            <div class="stat"><div>Попаданий</div><div class="v" id="shotsHit">0</div></div>
           </div>
         </div>
         <div class="card timeline">
@@ -154,18 +150,244 @@
   }
   </script>
 
-  <!-- МОДУЛЬНЫЙ СКРИПТ С ПРЯМЫМИ ПУТЯМИ -->
   <script type="module">
     import * as THREE from 'three';
     import { OrbitControls } from './OrbitControls.js';
 
-    window.debugMode = false;
+    class LaserProjectile {
+      constructor(startPos, targetPos, robotData, scene, visualizer) {
+        this.scene = scene;
+        this.visualizer = visualizer;
+        this.robotData = robotData;
+        this.startPos = startPos.clone();
+        this.targetPos = targetPos.clone();
+        this.currentPos = startPos.clone();
+        this.speed = 25.0; // units per second
+        this.maxRange = robotData.laser_range || 8.0;
+        this.accuracy = this.calculateAccuracy();
+        this.isActive = true;
+        this.startTime = Date.now();
+        this.hasHit = false;
+
+        // Calculate actual target with accuracy spread
+        this.actualTarget = this.calculateActualTarget();
+        this.direction = this.actualTarget.clone().sub(this.startPos).normalize();
+        this.totalDistance = this.startPos.distanceTo(this.actualTarget);
+        
+        this.createMesh();
+        this.scene.add(this.mesh);
+      }
+
+      calculateAccuracy() {
+        if (!this.robotData.aim_action) return 0.8;
+        
+        const aimVector = new THREE.Vector3(
+          this.robotData.aim_action[0] || 0,
+          this.robotData.aim_action[1] || 0,
+          this.robotData.aim_action[2] || 0
+        );
+        
+        // Better aim (smaller aim vector) = higher accuracy
+        const aimMagnitude = aimVector.length();
+        const baseAccuracy = 0.9;
+        const aimPenalty = Math.min(0.5, aimMagnitude * 0.3);
+        
+        // Distance penalty
+        const distance = this.startPos.distanceTo(this.targetPos);
+        const distancePenalty = Math.min(0.4, (distance / this.maxRange) * 0.3);
+        
+        return Math.max(0.2, baseAccuracy - aimPenalty - distancePenalty);
+      }
+
+      calculateActualTarget() {
+        const accuracy = this.accuracy;
+        const spread = (1 - accuracy) * 2.0; // Max spread of 2 units for worst accuracy
+        
+        const target = this.targetPos.clone();
+        
+        // Add random spread around the target
+        const spreadX = (Math.random() - 0.5) * spread;
+        const spreadY = (Math.random() - 0.5) * spread;
+        const spreadZ = (Math.random() - 0.5) * spread * 0.5; // Less vertical spread
+        
+        target.add(new THREE.Vector3(spreadX, spreadZ, spreadY));
+        
+        // Ensure target is within max range
+        const distance = this.startPos.distanceTo(target);
+        if (distance > this.maxRange) {
+          const direction = target.clone().sub(this.startPos).normalize();
+          target.copy(this.startPos).add(direction.multiplyScalar(this.maxRange));
+        }
+        
+        return target;
+      }
+
+      createMesh() {
+        // Create projectile visual
+        const geometry = new THREE.SphereGeometry(0.08, 8, 8);
+        const material = new THREE.MeshBasicMaterial({ 
+          color: 0xff4400,
+          emissive: 0xff2200,
+          emissiveIntensity: 0.8
+        });
+        
+        this.mesh = new THREE.Mesh(geometry, material);
+        this.mesh.position.copy(this.currentPos);
+
+        // Create trail effect
+        this.trailPoints = [this.currentPos.clone()];
+        this.createTrail();
+      }
+
+      createTrail() {
+        const trailGeometry = new THREE.BufferGeometry();
+        const trailMaterial = new THREE.LineBasicMaterial({ 
+          color: 0xff6600,
+          transparent: true,
+          opacity: 0.6
+        });
+        
+        this.trailLine = new THREE.Line(trailGeometry, trailMaterial);
+        this.scene.add(this.trailLine);
+      }
+
+      updateTrail() {
+        if (this.trailPoints.length > 10) {
+          this.trailPoints.shift();
+        }
+        this.trailPoints.push(this.currentPos.clone());
+        
+        this.trailLine.geometry.dispose();
+        this.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(this.trailPoints);
+      }
+
+      update(deltaTime) {
+        if (!this.isActive) return false;
+
+        const distance = this.speed * deltaTime;
+        const movement = this.direction.clone().multiplyScalar(distance);
+        this.currentPos.add(movement);
+        
+        this.mesh.position.copy(this.currentPos);
+        this.updateTrail();
+
+        // Check if reached target or max range
+        const traveledDistance = this.startPos.distanceTo(this.currentPos);
+        const targetDistance = this.currentPos.distanceTo(this.actualTarget);
+        
+        if (targetDistance < 0.2 || traveledDistance >= this.totalDistance) {
+          this.checkForHit();
+          this.explode();
+          return false;
+        }
+
+        // Check for collision with robots
+        this.checkRobotCollision();
+        
+        return true;
+      }
+
+      checkRobotCollision() {
+        if (this.hasHit) return;
+
+        const robots = this.visualizer.robots;
+        for (const [robotId, robotMesh] of robots.entries()) {
+          if (robotId === this.robotData.id) continue; // Don't hit self
+          
+          const distance = this.currentPos.distanceTo(robotMesh.position);
+          if (distance < 0.8) { // Robot collision radius
+            const frame = this.visualizer.frames[this.visualizer.cur];
+            const targetRobot = frame?.robots?.find(r => r.id === robotId);
+            
+            if (targetRobot && targetRobot.alive) {
+              this.hasHit = true;
+              this.explode(true);
+              this.visualizer.registerHit(this.robotData.id, robotId, this.currentPos);
+              return;
+            }
+          }
+        }
+      }
+
+      checkForHit() {
+        if (this.hasHit) return;
+
+        // Check if close enough to intended target
+        const frame = this.visualizer.frames[this.visualizer.cur];
+        if (!frame) return;
+
+        const targetRobot = frame.robots?.find(r => 
+          r.team !== this.robotData.team && r.alive
+        );
+
+        if (targetRobot) {
+          const targetPos = new THREE.Vector3(targetRobot.x, targetRobot.z, targetRobot.y);
+          const hitDistance = this.currentPos.distanceTo(targetPos);
+          
+          if (hitDistance < 1.0) { // Hit tolerance
+            this.hasHit = true;
+            this.visualizer.registerHit(this.robotData.id, targetRobot.id, this.currentPos);
+          }
+        }
+      }
+
+      explode(hit = false) {
+        this.isActive = false;
+        
+        // Create explosion effect
+        const explosionGeometry = new THREE.SphereGeometry(hit ? 0.5 : 0.3, 12, 12);
+        const explosionMaterial = new THREE.MeshBasicMaterial({
+          color: hit ? 0xff0000 : 0xffaa00,
+          transparent: true,
+          opacity: 0.8
+        });
+        
+        const explosion = new THREE.Mesh(explosionGeometry, explosionMaterial);
+        explosion.position.copy(this.currentPos);
+        this.scene.add(explosion);
+
+        // Animate explosion
+        let scale = 0.1;
+        let opacity = 0.8;
+        const animate = () => {
+          scale += 0.1;
+          opacity -= 0.05;
+          
+          explosion.scale.setScalar(scale);
+          explosion.material.opacity = opacity;
+          
+          if (opacity <= 0) {
+            this.scene.remove(explosion);
+            explosion.geometry.dispose();
+            explosion.material.dispose();
+          } else {
+            requestAnimationFrame(animate);
+          }
+        };
+        animate();
+      }
+
+      destroy() {
+        if (this.mesh) {
+          this.scene.remove(this.mesh);
+          this.mesh.geometry.dispose();
+          this.mesh.material.dispose();
+        }
+        
+        if (this.trailLine) {
+          this.scene.remove(this.trailLine);
+          this.trailLine.geometry.dispose();
+          this.trailLine.material.dispose();
+        }
+      }
+    }
 
     class Visualizer {
       constructor(){
         this.data=null; this.frames=[]; this.bounds=null; this.laser=null;
-        this.cur=0; this.isPlay=false; this.speed=1; this.showBounds=true; this.showTrails=true;
+        this.cur=0; this.isPlay=false; this.speed=1; this.showBounds=true; this.showTrails=true; this.showProjectiles=true;
         this.recent=[]; this.robots=new Map(); this.trails=new Map(); this.trailsLines=new Map(); this.followId=null;
+        this.projectiles = new Set(); this.battleStats = { shotsFired: 0, shotsHit: 0 };
 
         this.$=id=>document.getElementById(id);
         this.hookUI();
@@ -173,12 +395,27 @@
         this.init3D();
       }
 
-      updateDebugStatus() {
-        if (!window.debugMode) return;
-        this.$('sceneStatus').textContent = this.scene ? '✅' : '❌';
-        this.$('dataStatus').textContent = this.data ? '✅' : '❌';
-        this.$('framesStatus').textContent = this.frames.length;
-        this.$('currentStatus').textContent = this.cur;
+      registerHit(shooterId, targetId, position) {
+        this.battleStats.shotsHit++;
+        this.updateBattleStatsUI();
+        
+        // Add hit event to recent events
+        this.recent.unshift({
+          type: 'hit',
+          shooter: shooterId,
+          target: targetId,
+          timestamp: Date.now(),
+          position: position.toArray()
+        });
+        
+        if (this.recent.length > 20) {
+          this.recent.pop();
+        }
+      }
+
+      updateBattleStatsUI() {
+        this.$('shotsFired').textContent = this.battleStats.shotsFired;
+        this.$('shotsHit').textContent = this.battleStats.shotsHit;
       }
 
       hookUI(){
@@ -186,7 +423,6 @@
         this.$('btnPlay').onclick=()=>this.play();
         this.$('btnPause').onclick=()=>this.pause();
         this.$('btnReset').onclick=()=>this.reset();
-        this.$('btnDebug').onclick=()=>this.toggleDebug();
         this.$('btnCreateDemo').onclick=()=>this.createDemoData();
 
         this.$('speed').addEventListener('input',e=>{
@@ -208,6 +444,10 @@
           if(this.fieldGroup) this.fieldGroup.visible=this.showBounds;
         });
 
+        this.$('toggleProjectiles').addEventListener('change',e=>{
+          this.showProjectiles=e.target.checked;
+        });
+
         this.$('frame').addEventListener('input',e=>{
           this.cur = Math.min(this.frames.length-1, Math.max(0, Number(e.target.value)||0));
           this.updateFrame(true);
@@ -216,21 +456,6 @@
         document.querySelectorAll('[data-cam]').forEach(b=>{
           b.addEventListener('click',()=>this.setCam(b.dataset.cam));
         });
-      }
-
-      toggleDebug() {
-        window.debugMode = !window.debugMode;
-        const debug = this.$('debugInfo');
-        if (window.debugMode) {
-          debug.classList.remove('hidden');
-          this.updateDebugStatus();
-          if (!this._dbgInterval) {
-            this._dbgInterval = setInterval(() => this.updateDebugStatus(), 1000);
-          }
-        } else {
-          debug.classList.add('hidden');
-          if (this._dbgInterval){ clearInterval(this._dbgInterval); this._dbgInterval = null; }
-        }
       }
 
       hookFile(){
@@ -253,17 +478,29 @@
 
       async loadFile(file){
         try {
+          console.log(`📂 Loading battle file: ${file.name}`);
           const txt = await file.text();
           const json = JSON.parse(txt);
+          
+          console.log(`✅ File loaded successfully:`);
+          console.log(`   Battle ID: ${json.battle_id || 'Unknown'}`);
+          console.log(`   Frames: ${json.frames?.length || 0}`);
+          console.log(`   Teams: ${json.red_team_size || 0}v${json.blue_team_size || 0}`);
+          
           this.ingest(json);
-        } catch(e) { alert('Не удалось загрузить файл: ' + e.message); }
+        } catch(e) { 
+          console.error(`❌ Failed to load file: ${file.name}`, e);
+          alert('Не удалось загрузить файл: ' + e.message); 
+        }
       }
 
       createDemoData() {
+        console.log("🎮 Creating demo battle data...");
+        
         const demoData = {
-          battle_id: "demo_battle_3d",
+          battle_id: "demo_battle_3d_" + Date.now(),
           start_time: Date.now() / 1000,
-          end_time: Date.now() / 1000 + 10,
+          end_time: Date.now() / 1000 + 12,
           red_team_size: 2,
           blue_team_size: 2,
           winner: "red",
@@ -273,7 +510,7 @@
           frames: []
         };
 
-        for (let i = 0; i < 50; i++) {
+        for (let i = 0; i < 60; i++) {
           const frame = {
             timestamp: demoData.start_time + i * 0.2,
             step: i,
@@ -286,12 +523,12 @@
                 x:-5+Math.sin(i*0.1)*2, y:-2+Math.cos(i*0.15)*1.5, z:2+Math.sin(i*0.2)*1,
                 hp:Math.max(0,100-i*1.5), alive:100-i*1.5>0, within_bounds:true,
                 target_enemy:0, move_action:[0.1,0.05,0.02], aim_action:[0.2,-0.1,0.0],
-                fire_action: i%10===0, laser_range:8.0, can_shoot_targets:["blue_0","blue_1"] },
+                fire_action: i%15===0, laser_range:8.0, can_shoot_targets:["blue_0","blue_1"] },
               { id:"red_1",team:"red",
                 x:-3+Math.cos(i*0.12)*1.5, y:1+Math.sin(i*0.18)*2, z:1.5+Math.cos(i*0.25)*0.8,
                 hp:Math.max(0,100-i*1.2), alive:100-i*1.2>0, within_bounds:true,
                 target_enemy:1, move_action:[-0.05,0.1,-0.01], aim_action:[-0.15,0.2,0.05],
-                fire_action: i%8===0, laser_range:8.0, can_shoot_targets:["blue_0"] },
+                fire_action: i%18===0, laser_range:8.0, can_shoot_targets:["blue_0"] },
               { id:"blue_0",team:"blue",
                 x:5+Math.sin(i*0.11)*-1.8, y:2+Math.cos(i*0.16)*-1.2, z:2.5+Math.sin(i*0.22)*0.9,
                 hp:Math.max(0,100-i*2.0), alive:100-i*2.0>0, within_bounds:true,
@@ -301,19 +538,36 @@
                 x:3+Math.cos(i*0.13)*-2.2, y:-1+Math.sin(i*0.14)*-1.8, z:1.8+Math.cos(i*0.28)*1.1,
                 hp:Math.max(0,100-i*1.8), alive:100-i*1.8>0, within_bounds:true,
                 target_enemy:1, move_action:[0.08,-0.12,-0.02], aim_action:[0.18,-0.22,0.08],
-                fire_action: i%15===0, laser_range:8.0, can_shoot_targets:["red_1"] }
+                fire_action: i%20===0, laser_range:8.0, can_shoot_targets:["red_1"] }
             ]
           };
-          if (i % 10 === 0) {
-            frame.events.push({type:"fire",timestamp:frame.timestamp,robot_id:"red_0",target_id:"blue_0",
-              position:[frame.robots[0].x,frame.robots[0].y,frame.robots[0].z],distance:8.5,success:true});
-          }
+          
+          // Add firing events
+          frame.robots.forEach(robot => {
+            if (robot.fire_action && robot.alive) {
+              frame.events.push({
+                type:"fire",
+                timestamp:frame.timestamp,
+                robot_id:robot.id,
+                target_id:null,
+                position:[robot.x, robot.y, robot.z],
+                distance:8.5,
+                success:Math.random() > 0.3
+              });
+            }
+          });
+          
           demoData.frames.push(frame);
         }
+        
+        console.log(`✅ Demo data created: ${demoData.frames.length} frames`);
         this.ingest(demoData);
       }
 
       ingest(json){
+        // Полная очистка перед загрузкой нового боя
+        this.clearBattle();
+        
         this.data = json;
         this.frames = Array.isArray(json.frames) ? json.frames : [];
         this.bounds = json.field_bounds || (this.frames[0]?.field_bounds) || {x_min:-10,x_max:10,y_min:-8,y_max:8,z_min:0,z_max:6};
@@ -323,14 +577,104 @@
         this.$('frame').max = this.frames.length ? (this.frames.length-1) : 0;
         this.$('hint').classList.add('hidden');
 
+        // Сброс всех состояний
         this.robots.clear();
         this.trails.clear();
         this.trailsLines.forEach(line => { this.scene?.remove(line); line.geometry?.dispose(); });
         this.trailsLines.clear();
+        
+        // Очистка снарядов
+        this.projectiles.forEach(proj => proj.destroy());
+        this.projectiles.clear();
+        
+        // Сброс статистики
+        this.battleStats = { shotsFired: 0, shotsHit: 0 };
+        this.recent = [];
+        this.updateBattleStatsUI();
 
         if (this.scene) this.updateField();
-        this.pause(); this.cur = 0; this.updateFrame(true);
-        this.$('dataStatus').textContent = '✅';
+        this.pause(); 
+        this.cur = 0; 
+        this.updateFrame(true);
+      }
+
+      clearBattle() {
+        // """Полностью очищает текущий бой"""
+        console.log("🧹 Clearing battle scene...");
+        
+        if (!this.scene) return;
+        
+        // Удаляем всех роботов из сцены
+        this.robots.forEach((robotGroup, robotId) => {
+          console.log(`Removing robot: ${robotId}`);
+          this.scene.remove(robotGroup);
+          
+          // Очищаем геометрию и материалы
+          robotGroup.traverse((child) => {
+            if (child.geometry) {
+              child.geometry.dispose();
+            }
+            if (child.material) {
+              if (Array.isArray(child.material)) {
+                child.material.forEach(material => material.dispose());
+              } else {
+                child.material.dispose();
+              }
+            }
+          });
+        });
+        this.robots.clear();
+        
+        // Удаляем все следы
+        this.trailsLines.forEach((line, robotId) => {
+          console.log(`Removing trail: ${robotId}`);
+          this.scene.remove(line);
+          if (line.geometry) line.geometry.dispose();
+          if (line.material) line.material.dispose();
+        });
+        this.trailsLines.clear();
+        this.trails.clear();
+        
+        // Удаляем все снаряды
+        this.projectiles.forEach(projectile => {
+          console.log(`Removing projectile: ${projectile.constructor.name}`);
+          projectile.destroy();
+        });
+        this.projectiles.clear();
+        
+        // Очищаем дополнительные объекты (лазеры, взрывы и т.д.)
+        const objectsToRemove = [];
+        this.scene.children.forEach(child => {
+          // Удаляем объекты, которые не являются основными компонентами сцены
+          if (child !== this.fieldGroup && 
+              !child.isLight && 
+              !child.isAmbientLight && 
+              !child.isDirectionalLight &&
+              child.type !== 'GridHelper') {
+            objectsToRemove.push(child);
+          }
+        });
+        
+        objectsToRemove.forEach(obj => {
+          console.log(`Removing scene object: ${obj.type || 'Unknown'}`);
+          this.scene.remove(obj);
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) {
+            if (Array.isArray(obj.material)) {
+              obj.material.forEach(material => material.dispose());
+            } else {
+              obj.material.dispose();
+            }
+          }
+        });
+        
+        // Сброс камеры следования
+        this.followId = null;
+        
+        // Очищаем recent события
+        this.recent = [];
+        
+        console.log("✅ Battle scene cleared");
       }
 
       init3D(){
@@ -387,10 +731,21 @@
         };
         window.addEventListener('resize', onResize);
 
-        const animate = () => {
+        this.lastTime = 0;
+        const animate = (currentTime) => {
           requestAnimationFrame(animate);
+          
+          const deltaTime = (currentTime - this.lastTime) / 1000;
+          this.lastTime = currentTime;
+          
           this.controls.update();
+          
           if (this.showTrails && this.trails.size) this.updateTrails();
+          
+          // Update projectiles
+          if (this.showProjectiles) {
+            this.updateProjectiles(deltaTime);
+          }
 
           if (this.followId && this.robots.has(this.followId)) {
             const robotGroup = this.robots.get(this.followId);
@@ -401,9 +756,22 @@
           }
           this.renderer.render(this.scene, this.camera);
         };
-        animate();
+        animate(0);
+      }
 
-        this.$('sceneStatus').textContent = '✅';
+      updateProjectiles(deltaTime) {
+        const projectilesToRemove = [];
+        
+        this.projectiles.forEach(projectile => {
+          if (!projectile.update(deltaTime)) {
+            projectilesToRemove.push(projectile);
+          }
+        });
+        
+        projectilesToRemove.forEach(projectile => {
+          this.projectiles.delete(projectile);
+          projectile.destroy();
+        });
       }
 
       buildField(){
@@ -556,27 +924,47 @@
           }
         }
 
-        if (data.fire_action && data.alive) {
-          this.createLaserEffect(group.position, data.aim_action || [1, 0, 0]);
+        // Create laser projectile when firing
+        if (data.fire_action && data.alive && this.showProjectiles) {
+          this.createLaserProjectile(group.position, data);
         }
       }
 
-      createLaserEffect(position, aimDirection) {
-        const laserGeometry = new THREE.CylinderGeometry(0.02, 0.02, 8, 8);
-        const laserMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 0.8 });
-        const laser = new THREE.Mesh(laserGeometry, laserMaterial);
-        laser.position.copy(position); laser.position.y += 0.4;
-        const [aimX, aimY, aimZ] = aimDirection || [1,0,0];
-        const direction = new THREE.Vector3(aimX, aimY, aimZ).normalize();
-        laser.lookAt(laser.position.clone().add(direction)); laser.rotateX(Math.PI / 2);
-        this.scene.add(laser);
-        let opacity = 0.8;
-        const fadeOut = () => {
-          opacity -= 0.05; laser.material.opacity = opacity;
-          if (opacity <= 0) { this.scene.remove(laser); laser.geometry.dispose(); laser.material.dispose(); }
-          else { requestAnimationFrame(fadeOut); }
-        };
-        setTimeout(fadeOut, 100);
+      createLaserProjectile(shooterPos, robotData) {
+        this.battleStats.shotsFired++;
+        this.updateBattleStatsUI();
+
+        // Find target robot
+        const frame = this.frames[this.cur];
+        if (!frame) return;
+
+        const enemyRobots = frame.robots.filter(r => 
+          r.team !== robotData.team && r.alive
+        );
+
+        if (enemyRobots.length === 0) return;
+
+        // Choose target (closest enemy for simplicity)
+        let targetRobot = enemyRobots[0];
+        let minDistance = Infinity;
+
+        enemyRobots.forEach(enemy => {
+          const distance = Math.sqrt(
+            Math.pow(shooterPos.x - enemy.x, 2) +
+            Math.pow(shooterPos.z - enemy.z, 2) +
+            Math.pow(shooterPos.y - enemy.y, 2)
+          );
+          if (distance < minDistance) {
+            minDistance = distance;
+            targetRobot = enemy;
+          }
+        });
+
+        const startPos = new THREE.Vector3(shooterPos.x, shooterPos.y + 0.4, shooterPos.z);
+        const targetPos = new THREE.Vector3(targetRobot.x, targetRobot.z + 0.4, targetRobot.y);
+
+        const projectile = new LaserProjectile(startPos, targetPos, robotData, this.scene, this);
+        this.projectiles.add(projectile);
       }
 
       updateTrails(){
@@ -604,23 +992,59 @@
         if (!this.frames.length || !this.scene) return;
         const frame = this.frames[this.cur]; if (!frame) return;
 
+        const currentRobotIds = new Set((frame.robots || []).map(r => r.id));
+        
+        // Удаляем роботов, которых больше нет в текущем кадре
+        const robotsToRemove = [];
+        this.robots.forEach((robotGroup, robotId) => {
+          if (!currentRobotIds.has(robotId)) {
+            robotsToRemove.push(robotId);
+          }
+        });
+        
+        robotsToRemove.forEach(robotId => {
+          console.log(`Removing robot not in current frame: ${robotId}`);
+          const robotGroup = this.robots.get(robotId);
+          this.scene.remove(robotGroup);
+          
+          // Очищаем геометрию и материалы
+          robotGroup.traverse((child) => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) {
+              if (Array.isArray(child.material)) {
+                child.material.forEach(material => material.dispose());
+              } else {
+                child.material.dispose();
+              }
+            }
+          });
+          
+          this.robots.delete(robotId);
+          
+          // Удаляем следы этого робота
+          if (this.trailsLines.has(robotId)) {
+            const trailLine = this.trailsLines.get(robotId);
+            this.scene.remove(trailLine);
+            if (trailLine.geometry) trailLine.geometry.dispose();
+            if (trailLine.material) trailLine.material.dispose();
+            this.trailsLines.delete(robotId);
+          }
+          if (this.trails.has(robotId)) {
+            this.trails.delete(robotId);
+          }
+        });
+
+        // Обновляем или создаем роботов из текущего кадра
         (frame.robots || []).forEach(robotData => {
           let robotGroup = this.robots.get(robotData.id);
           if (!robotGroup) {
+            console.log(`Creating new robot: ${robotData.id}`);
             robotGroup = this.createRobotMesh(robotData);
             this.scene.add(robotGroup);
             this.robots.set(robotData.id, robotGroup);
           }
           this.updateRobotMesh(robotGroup, robotData);
         });
-
-        const currentRobotIds = new Set((frame.robots || []).map(r => r.id));
-        for (const [robotId, robotGroup] of this.robots.entries()) {
-          if (!currentRobotIds.has(robotId)) {
-            this.scene.remove(robotGroup);
-            this.robots.delete(robotId);
-          }
-        }
 
         this.updateBattleStats(frame.robots || []);
         const startTime = this.data?.start_time || 0;
@@ -629,7 +1053,6 @@
 
         if (syncSlider) { this.$('cur').textContent = this.cur; this.$('frame').value = this.cur; }
         this.renderEvents(frame.events || []);
-        this.updateDebugStatus();
       }
 
       updateBattleStats(robots) {
@@ -648,17 +1071,30 @@
 
       renderEvents(events){
         if (!events || !events.length) {
-          this.$('events').textContent = 'Событий пока нет';
-          return;
+          if (this.recent.length === 0) {
+            this.$('events').textContent = 'Событий пока нет';
+            return;
+          }
+          events = this.recent.slice(-8);
         }
-        const recentEvents = events.slice(-8).reverse();
-        const html = recentEvents.map(event => {
+        
+        const allEvents = [...events, ...this.recent].slice(-8).reverse();
+        const html = allEvents.map(event => {
           const type = event.type || 'event';
-          const robotId = event.robot_id || event.robot || '';
-          const targetId = event.target_id ? ` → ${event.target_id}` : '';
+          const robotId = event.robot_id || event.robot || event.shooter || '';
+          const targetId = event.target_id || event.target ? ` → ${event.target_id || event.target}` : '';
           const distance = (event.distance != null) ? ` • d=${Number(event.distance).toFixed(2)}` : '';
           const success = event.success ? ' ✅' : (event.success === false ? ' ❌' : '');
-          return `<div class="kv"><span>${type}${success}</span><span class="mono">${robotId}${targetId}${distance}</span></div>`;
+          
+          let icon = '';
+          switch(type) {
+            case 'fire': icon = '🔥'; break;
+            case 'hit': icon = '💥'; break;
+            case 'laser_miss': icon = '⭕'; break;
+            default: icon = '📡';
+          }
+          
+          return `<div class="kv"><span>${icon} ${type}${success}</span><span class="mono">${robotId}${targetId}${distance}</span></div>`;
         }).join('');
         this.$('events').innerHTML = html;
       }
@@ -693,6 +1129,7 @@
           const frame = this.frames[this.cur];
           const robotData = frame?.robots?.find(r => r.id === robotId);
           if (robotData) {
+            const accuracy = this.calculateRobotAccuracy(robotData);
             const info = `
               <div class="kv"><span>ID</span><span class="mono">${robotData.id}</span></div>
               <div class="kv"><span>Команда</span><span style="color: ${robotData.team === 'red' ? '#ff5757' : '#5b8dff'}">${robotData.team}</span></div>
@@ -700,6 +1137,7 @@
               <div class="kv"><span>Позиция</span><span class="mono">[${robotData.x?.toFixed(1)}, ${robotData.y?.toFixed(1)}, ${robotData.z?.toFixed(1)}]</span></div>
               <div class="kv"><span>Жив</span><span>${robotData.alive ? '✅' : '❌'}</span></div>
               <div class="kv"><span>В границах</span><span>${robotData.within_bounds ? '✅' : '❌'}</span></div>
+              <div class="kv"><span>Точность</span><span>${(accuracy * 100).toFixed(1)}%</span></div>
               <div class="kv"><span>Цель</span><span>${robotData.target_enemy}</span></div>
               <div class="kv"><span>Огонь</span><span>${robotData.fire_action ? '🔥' : '⭕'}</span></div>
               <div class="kv"><span>Следование</span><span>ON</span></div>
@@ -707,6 +1145,22 @@
             this.$('robotInfo').innerHTML = info;
           }
         }
+      }
+
+      calculateRobotAccuracy(robotData) {
+        if (!robotData.aim_action) return 0.8;
+        
+        const aimVector = new THREE.Vector3(
+          robotData.aim_action[0] || 0,
+          robotData.aim_action[1] || 0,
+          robotData.aim_action[2] || 0
+        );
+        
+        const aimMagnitude = aimVector.length();
+        const baseAccuracy = 0.9;
+        const aimPenalty = Math.min(0.5, aimMagnitude * 0.3);
+        
+        return Math.max(0.2, baseAccuracy - aimPenalty);
       }
 
       setCam(preset){
@@ -758,10 +1212,25 @@
       pause(){ this.isPlay = false; }
 
       reset(){
-        this.pause(); this.cur = 0; this.updateFrame(true);
-        this.trails.clear();
-        this.trailsLines.forEach(line => { this.scene?.remove(line); line.geometry?.dispose(); });
-        this.trailsLines.clear();
+        this.pause(); 
+        
+        // Полная очистка перед сбросом
+        this.clearBattle();
+        
+        this.cur = 0; 
+        this.updateFrame(true);
+        
+        // Сброс камеры к обзорной позиции
+        if (this.bounds && this.camera && this.controls) {
+          const centerX = (this.bounds.x_min + this.bounds.x_max) / 2;
+          const centerY = (this.bounds.y_min + this.bounds.y_max) / 2;
+          const centerZ = (this.bounds.z_min + this.bounds.z_max) / 2;
+          this.camera.position.set(centerX + 20, centerZ + 16, centerY + 20);
+          this.controls.target.set(centerX, centerZ, centerY);
+          this.controls.update();
+        }
+        
+        console.log("🔄 Battle reset completed");
       }
     }
 
@@ -782,8 +1251,20 @@
         const v = window.visualizer; if (!v || !v.scene) return;
         console.log('Children:', v.scene.children.length);
         console.log('Robots:', v.robots.size);
+        console.log('Projectiles:', v.projectiles.size);
         console.log('Current frame:', v.cur);
         console.log('Total frames:', v.frames.length);
+        console.log('Battle stats:', v.battleStats);
+      },
+      fireLaser: () => {
+        const v = window.visualizer; if (!v || !v.scene || !v.robots.size) return;
+        const robot = v.robots.values().next().value;
+        const testData = { 
+          id: robot.name, team: robot.userData.team, 
+          aim_action: [0.1, 0.0, 0.1], laser_range: 8.0,
+          fire_action: true, alive: true
+        };
+        v.createLaserProjectile(robot.position, testData);
       }
     };
   </script>

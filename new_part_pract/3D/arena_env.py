@@ -1,13 +1,15 @@
 """
-ArenaEnv — 3D версия для Ray 2.48
+ArenaEnv — 3D версия для Ray 2.48 с поддержкой системы снарядов
 Главные изменения: 
 - Трехмерное пространство (x, y, z)
 - Ограниченное поле боя с смертью при выходе за границы
 - Лазеры с ограниченным радиусом действия
+- ДОБАВЛЕНО: Улучшенная система лазерных выстрелов для визуализации снарядов
+- ДОБАВЛЕНО: Детальная информация о точности и баллистике
 """
 
 import numpy as np
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from gymnasium import spaces
 from ray.rllib.env import MultiAgentEnv
 
@@ -32,12 +34,98 @@ FIELD_BOUNDS = {
     'z_min': 0.0,   'z_max': 6.0
 }
 
-# Параметры лазера
-LASER_MAX_RANGE = 8.0  # Максимальная дальность лазера
-LASER_DAMAGE = 15.0    # Урон лазера
+# Параметры лазера и снарядов
+LASER_MAX_RANGE = 8.0      # Максимальная дальность лазера
+LASER_DAMAGE = 15.0        # Урон лазера
+PROJECTILE_SPEED = 25.0    # Скорость снаряда (units/second)
+ACCURACY_BASE = 0.9        # Базовая точность
+ACCURACY_FALLOFF = 0.1     # Снижение точности с расстоянием
 
 def _box(lo, hi, shape):
     return spaces.Box(low=lo, high=hi, shape=shape, dtype=np.float32)
+
+class LaserShot:
+    """Класс для отслеживания лазерного выстрела"""
+    def __init__(self, shooter_id: str, shooter_pos: np.ndarray, target_pos: np.ndarray, 
+                 aim_vector: np.ndarray, timestamp: float):
+        self.shooter_id = shooter_id
+        self.shooter_pos = shooter_pos.copy()
+        self.target_pos = target_pos.copy()
+        self.aim_vector = aim_vector.copy()
+        self.timestamp = timestamp
+        self.accuracy = self._calculate_accuracy()
+        self.actual_impact = self._calculate_impact_point()
+        self.hit_probability = self._calculate_hit_probability()
+        
+    def _calculate_accuracy(self) -> float:
+        """Рассчитывает точность выстрела на основе прицеливания"""
+        # Безопасная проверка aim_vector
+        if self.aim_vector is None or self.aim_vector.size == 0:
+            return 0.8
+            
+        aim_magnitude = float(np.linalg.norm(self.aim_vector))
+        distance = float(np.linalg.norm(self.target_pos - self.shooter_pos))
+        
+        # Базовая точность снижается с увеличением разброса прицеливания
+        aim_penalty = min(0.5, aim_magnitude * 0.3)
+        
+        # Точность снижается с расстоянием
+        distance_penalty = min(0.4, (distance / LASER_MAX_RANGE) * 0.3)
+        
+        accuracy = max(0.2, ACCURACY_BASE - aim_penalty - distance_penalty)
+        return float(accuracy)
+    
+    def _calculate_impact_point(self) -> np.ndarray:
+        """Рассчитывает фактическую точку попадания с учетом разброса"""
+        spread = (1 - self.accuracy) * 2.0  # Максимальный разброс 2 единицы
+        
+        # Добавляем случайное отклонение
+        spread_x = (np.random.random() - 0.5) * spread
+        spread_y = (np.random.random() - 0.5) * spread  
+        spread_z = (np.random.random() - 0.5) * spread * 0.5  # Меньший разброс по высоте
+        
+        impact_point = self.target_pos + np.array([spread_x, spread_y, spread_z])
+        
+        # Ограничиваем дальность
+        distance = np.linalg.norm(impact_point - self.shooter_pos)
+        if distance > LASER_MAX_RANGE:
+            direction = impact_point - self.shooter_pos
+            direction = direction / np.linalg.norm(direction)
+            impact_point = self.shooter_pos + direction * LASER_MAX_RANGE
+            
+        return impact_point
+    
+    def _calculate_hit_probability(self) -> float:
+        """Рассчитывает вероятность попадания"""
+        distance_to_target = np.linalg.norm(self.actual_impact - self.target_pos)
+        
+        # Попадание если в радиусе 1.0 единицы от цели
+        hit_radius = 1.0
+        if distance_to_target <= hit_radius:
+            return 1.0
+        else:
+            # Вероятность попадания падает с расстоянием
+            return max(0.0, 1.0 - (distance_to_target - hit_radius) / 2.0)
+    
+    def will_hit(self, target_pos: np.ndarray) -> bool:
+        """Определяет попадет ли выстрел в цель"""
+        distance_to_target = np.linalg.norm(self.actual_impact - target_pos)
+        return distance_to_target <= 1.0  # Радиус попадания
+    
+    def get_shot_info(self) -> Dict[str, Any]:
+        """Возвращает информацию о выстреле для записи"""
+        return {
+            "shooter_id": self.shooter_id,
+            "shooter_pos": self.shooter_pos.tolist(),
+            "target_pos": self.target_pos.tolist(),
+            "actual_impact": self.actual_impact.tolist(),
+            "accuracy": self.accuracy,
+            "hit_probability": self.hit_probability,
+            "aim_vector": self.aim_vector.tolist(),
+            "timestamp": self.timestamp,
+            "max_range": LASER_MAX_RANGE,
+            "distance": float(np.linalg.norm(self.target_pos - self.shooter_pos))
+        }
 
 class ArenaEnv(MultiAgentEnv):
     def __init__(self, env_config: Optional[Dict[str, Any]] = None):
@@ -86,7 +174,20 @@ class ArenaEnv(MultiAgentEnv):
         self.count_invalid_target = 0
         self.count_oob_move = 0
         self.count_oob_aim = 0
-        self.count_boundary_deaths = 0  # Новая метрика для смертей от границ
+        self.count_boundary_deaths = 0
+        
+        # Новые метрики для снарядной системы
+        self.count_shots_fired = 0
+        self.count_shots_hit = 0
+        self.count_shots_missed = 0
+        self.shot_accuracy_history = []
+        self.recent_laser_shots: List[LaserShot] = []
+
+        # Константы для внешнего доступа
+        self.FIELD_BOUNDS = FIELD_BOUNDS
+        self.LASER_MAX_RANGE = LASER_MAX_RANGE
+        self.LASER_DAMAGE = LASER_DAMAGE
+        self.PROJECTILE_SPEED = PROJECTILE_SPEED
 
     @property
     def observation_space(self): return self.single_obs_space
@@ -171,7 +272,6 @@ class ArenaEnv(MultiAgentEnv):
         can_fire_now = self._can_laser_hit(self._pos[shooter_id], self._pos[enemy_ids[tgt_idx]])
         return tgt_idx, was_corrected, can_fire_now
 
-
     def _vec(self, size):  # шумовые признаки для простоты
         return self.rng.normal(0, 0.1, size=size).astype(np.float32)
 
@@ -198,16 +298,81 @@ class ArenaEnv(MultiAgentEnv):
         distance = self._distance_3d(shooter_pos, target_pos)
         return distance <= LASER_MAX_RANGE
 
+    def _create_laser_shot(self, shooter_id: str, target_id: str, aim_vector: np.ndarray) -> LaserShot:
+        """Создает объект лазерного выстрела для отслеживания"""
+        shooter_pos = self._pos[shooter_id]
+        target_pos = self._pos[target_id]
+        timestamp = float(self._t)  # Используем текущий шаг как timestamp
+        
+        shot = LaserShot(shooter_id, shooter_pos, target_pos, aim_vector, timestamp)
+        self.recent_laser_shots.append(shot)
+        
+        # Ограничиваем историю выстрелов
+        if len(self.recent_laser_shots) > 100:
+            self.recent_laser_shots.pop(0)
+            
+        return shot
+
+    def _process_laser_shot(self, shot: LaserShot, target_id: str) -> Tuple[bool, float]:
+        """
+        Обрабатывает лазерный выстрел и определяет попадание
+        Возвращает (hit, damage)
+        """
+        target_pos = self._pos[target_id]
+        
+        # Проверяем попадание
+        hit = shot.will_hit(target_pos)
+        
+        if hit:
+            # Рассчитываем урон с учетом точности
+            base_damage = LASER_DAMAGE
+            accuracy_bonus = shot.accuracy * 0.3  # До 30% бонуса за точность
+            damage_variance = self.rng.uniform(-0.2, 0.2)  # ±20% разброс урона
+            
+            damage = base_damage * (1 + accuracy_bonus + damage_variance)
+            damage = max(5.0, damage)  # Минимальный урон
+            
+            self.count_shots_hit += 1
+            return True, float(damage)
+        else:
+            self.count_shots_missed += 1
+            return False, 0.0
+
+    def get_shooting_statistics(self) -> Dict[str, Any]:
+        """Возвращает статистику стрельбы для анализа"""
+        total_shots = self.count_shots_fired
+        hit_rate = (self.count_shots_hit / total_shots) if total_shots > 0 else 0.0
+        
+        avg_accuracy = (sum(self.shot_accuracy_history) / len(self.shot_accuracy_history)) \
+                      if self.shot_accuracy_history else 0.0
+        
+        return {
+            "total_shots": total_shots,
+            "shots_hit": self.count_shots_hit,
+            "shots_missed": self.count_shots_missed,
+            "hit_rate": hit_rate,
+            "average_accuracy": avg_accuracy,
+            "recent_shots": len(self.recent_laser_shots),
+            "projectile_system_enabled": True
+        }
+
     # ==== стандартный API Gym ====
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self._t = 0
         self._spawn()
+        
+        # Сброс метрик
         self.count_invalid_target = 0
         self.count_oob_move = 0
         self.count_oob_aim = 0
         self.count_boundary_deaths = 0
+        self.count_shots_fired = 0
+        self.count_shots_hit = 0
+        self.count_shots_missed = 0
+        self.shot_accuracy_history.clear()
+        self.recent_laser_shots.clear()
 
         obs, infos = {}, {}
         battle_type = (len(self._agents_red), len(self._agents_blue))
@@ -216,7 +381,9 @@ class ArenaEnv(MultiAgentEnv):
             infos[aid] = {
                 "battle_type": battle_type,
                 "field_bounds": FIELD_BOUNDS,
-                "laser_range": LASER_MAX_RANGE
+                "laser_range": LASER_MAX_RANGE,
+                "projectile_speed": PROJECTILE_SPEED,
+                "accuracy_system": True
             }
         return obs, infos
 
@@ -231,14 +398,16 @@ class ArenaEnv(MultiAgentEnv):
                 act_array = np.array(act, dtype=np.float32).flatten()
                 processed_actions[aid] = {
                     "target": int(act_array[0]) if len(act_array) > 0 else 0,
-                    "move": act_array[1:4] if len(act_array) > 3 else np.zeros(3, dtype=np.float32),  # 3D движение
-                    "aim": act_array[4:7] if len(act_array) > 6 else np.zeros(3, dtype=np.float32),   # 3D прицеливание
+                    "move": act_array[1:4] if len(act_array) > 3 else np.zeros(3, dtype=np.float32),
+                    "aim": act_array[4:7] if len(act_array) > 6 else np.zeros(3, dtype=np.float32),
                     "fire": int(act_array[7]) if len(act_array) > 7 else 0,
                 }
             else:
                 continue
         
         # 1) Применяем действия (с валидацией)
+        shots_this_step: List[LaserShot] = []
+        
         for aid, act in processed_actions.items():
             if not self._is_alive(aid):
                 continue
@@ -257,11 +426,11 @@ class ArenaEnv(MultiAgentEnv):
             # Обеспечиваем 3D размерность
             if len(mv) < 3:
                 mv = np.pad(mv, (0, 3 - len(mv)), mode='constant')
-            mv = mv[:3]  # Берем только первые 3 компонента
+            mv = mv[:3]
             
             if len(am) < 3:
                 am = np.pad(am, (0, 3 - len(am)), mode='constant')
-            am = am[:3]  # Берем только первые 3 компонента
+            am = am[:3]
             
             # Извлекаем скалярные значения правильно
             fire = int(act["fire"]) if np.isscalar(act["fire"]) else int(act["fire"].item() if hasattr(act["fire"], 'item') else act["fire"])
@@ -283,7 +452,7 @@ class ArenaEnv(MultiAgentEnv):
             enemy_ids = self._enemy_ids(aid)
             tgt_idx, was_corrected, can_fire_now = self._resolve_target(aid, tgt_idx)
             if was_corrected:
-                self.count_invalid_target += 1  # аккуратно считаем, но не падаем
+                self.count_invalid_target += 1
 
             # 3D кинематика
             old_pos = self._pos[aid].copy()
@@ -299,30 +468,29 @@ class ArenaEnv(MultiAgentEnv):
                 self.count_boundary_deaths += 1
                 print(f"Robot {aid} died by going out of bounds: {new_pos}")
             
-            # 3D попадание по цели с лазером
-            if fire == 1 and len(enemy_ids) > tgt_idx:
+            # Улучшенная 3D система стрельбы с снарядами
+            if fire == 1 and len(enemy_ids) > tgt_idx and can_fire_now:
                 tgt = enemy_ids[tgt_idx]
                 if self._is_alive(tgt):
-                    shooter_pos = self._pos[aid]
-                    target_pos = self._pos[tgt]
+                    self.count_shots_fired += 1
                     
-                    # Проверяем дальность лазера
-                    if self._can_laser_hit(shooter_pos, target_pos):
-                        # Вычисляем точность на основе прицеливания и расстояния
-                        distance = self._distance_3d(shooter_pos, target_pos)
-                        
-                        # Базовая вероятность попадания убывает с расстоянием
-                        base_accuracy = np.exp(-0.1 * distance)
-                        
-                        # Бонус от точности прицеливания (чем меньше am, тем точнее)
-                        aim_bonus = 0.5 + 0.5 * (1 - np.linalg.norm(am) / np.sqrt(3))
-                        
-                        hit_probability = base_accuracy * aim_bonus
-                        
-                        if self.rng.random() < hit_probability:
-                            damage = LASER_DAMAGE + self.rng.uniform(-5, 5)  # Небольшой разброс урона
-                            self._hp[tgt] -= damage
-                            print(f"Laser hit! {aid} -> {tgt}, damage: {damage:.1f}, distance: {distance:.1f}")
+                    # Создаем объект выстрела
+                    shot = self._create_laser_shot(aid, tgt, am)
+                    shots_this_step.append(shot)
+                    
+                    # Сохраняем точность для статистики
+                    self.shot_accuracy_history.append(shot.accuracy)
+                    
+                    # Обрабатываем выстрел
+                    hit, damage = self._process_laser_shot(shot, tgt)
+                    
+                    if hit:
+                        self._hp[tgt] -= damage
+                        print(f"Laser hit! {aid} -> {tgt}, damage: {damage:.1f}, "
+                              f"accuracy: {shot.accuracy:.2%}, distance: {shot.get_shot_info()['distance']:.1f}")
+                    else:
+                        print(f"Laser missed! {aid} -> {tgt}, "
+                              f"accuracy: {shot.accuracy:.2%}, distance: {shot.get_shot_info()['distance']:.1f}")
 
         # 2) Смерти
         for aid in list(self._agents_red + self._agents_blue):
@@ -403,9 +571,12 @@ class ArenaEnv(MultiAgentEnv):
         terms["__all__"] = False
         truncs["__all__"] = done
 
-        # 4) Infos только для агентов в obs
+        # 4) Infos только для агентов в obs с дополнительной информацией о снарядах
         red_step_sum = float(np.clip(sum(rews.get(a, 0.0) for a in self._agents_red), -100.0, 100.0))
         blue_step_sum = float(np.clip(sum(rews.get(a, 0.0) for a in self._agents_blue), -100.0, 100.0))
+
+        # Статистика выстрелов для этого шага
+        shooting_stats = self.get_shooting_statistics()
 
         for aid in alive_agents:
             infos[aid] = {
@@ -414,10 +585,23 @@ class ArenaEnv(MultiAgentEnv):
                 "oob_aim": self.count_oob_aim,
                 "boundary_deaths": self.count_boundary_deaths,
                 "team_step_reward": red_step_sum if aid.startswith("red_") else blue_step_sum,
-                "position_3d": self._pos[aid].tolist(),  # Добавляем 3D позицию
+                "position_3d": self._pos[aid].tolist(),
                 "laser_range": LASER_MAX_RANGE,
                 "field_bounds": FIELD_BOUNDS,
+                "projectile_speed": PROJECTILE_SPEED,
+                # Новая информация о снарядах
+                "shots_fired_total": shooting_stats["total_shots"],
+                "shots_hit_total": shooting_stats["shots_hit"],
+                "current_hit_rate": shooting_stats["hit_rate"],
+                "average_accuracy": shooting_stats["average_accuracy"],
+                "shots_this_step": len(shots_this_step),
+                "projectile_system": True
             }
+            
+            # Добавляем информацию о выстрелах этого робота в этом шаге
+            robot_shots = [shot for shot in shots_this_step if shot.shooter_id == aid]
+            if robot_shots:
+                infos[aid]["laser_shots"] = [shot.get_shot_info() for shot in robot_shots]
 
         return obs, rews, terms, truncs, infos
 
@@ -498,7 +682,15 @@ class ArenaEnv(MultiAgentEnv):
         global_state[10] = (FIELD_BOUNDS['z_max'] - FIELD_BOUNDS['z_min']) / 20.0
         global_state[11] = LASER_MAX_RANGE / 20.0  # Нормализованная дальность лазера
         
-        global_state[12:] = self._vec(GLOBAL_FEATS - 12)
+        # Добавляем информацию о снарядной системе
+        total_shots = max(1, self.count_shots_fired)  # Избегаем деления на ноль
+        global_state[12] = self.count_shots_fired / 100.0  # Нормализованное количество выстрелов
+        global_state[13] = self.count_shots_hit / total_shots  # Текущий hit rate
+        global_state[14] = (sum(self.shot_accuracy_history) / len(self.shot_accuracy_history)) \
+                          if self.shot_accuracy_history else 0.0  # Средняя точность
+        global_state[15] = len(self.recent_laser_shots) / 10.0  # Нормализованное количество недавних выстрелов
+        
+        global_state[16:] = self._vec(GLOBAL_FEATS - 16)
 
         # Клипинг всех значений к bounds
         return {
@@ -510,3 +702,209 @@ class ArenaEnv(MultiAgentEnv):
             "global_state": np.clip(global_state, -15.0, 15.0),
             "enemy_action_mask": enemy_action_mask,
         }
+
+    def get_battle_summary(self) -> Dict[str, Any]:
+        """Возвращает сводку текущего боя для анализа"""
+        return {
+            "step": self._t,
+            "red_agents": len(self._agents_red),
+            "blue_agents": len(self._agents_blue),
+            "red_alive": sum(self._alive_red.values()),
+            "blue_alive": sum(self._alive_blue.values()),
+            "red_hp": sum(max(0.0, self._hp[a]) for a in self._agents_red),
+            "blue_hp": sum(max(0.0, self._hp[a]) for a in self._agents_blue),
+            "boundary_deaths": self.count_boundary_deaths,
+            "shooting_stats": self.get_shooting_statistics(),
+            "field_bounds": FIELD_BOUNDS,
+            "laser_config": {
+                "max_range": LASER_MAX_RANGE,
+                "damage": LASER_DAMAGE,
+                "projectile_speed": PROJECTILE_SPEED
+            }
+        }
+
+    def export_battle_data_for_visualization(self) -> Dict[str, Any]:
+        """Экспортирует данные боя в формате для 3D визуализатора"""
+        robot_states = []
+        
+        for aid in self._agents_red + self._agents_blue:
+            if aid in self._pos:  # Робот существует
+                robot_states.append({
+                    "id": aid,
+                    "team": self._team[aid],
+                    "x": float(self._pos[aid][0]),
+                    "y": float(self._pos[aid][1]), 
+                    "z": float(self._pos[aid][2]),
+                    "hp": float(self._hp[aid]),
+                    "alive": self._is_alive(aid),
+                    "within_bounds": self._check_boundaries(self._pos[aid]),
+                    "laser_range": LASER_MAX_RANGE
+                })
+        
+        # Информация о недавних выстрелах
+        recent_shots = []
+        for shot in self.recent_laser_shots[-10:]:  # Последние 10 выстрелов
+            recent_shots.append(shot.get_shot_info())
+        
+        return {
+            "timestamp": float(self._t),
+            "step": self._t,
+            "robots": robot_states,
+            "field_bounds": FIELD_BOUNDS,
+            "laser_config": {
+                "max_range": LASER_MAX_RANGE,
+                "damage": LASER_DAMAGE,
+                "projectile_speed": PROJECTILE_SPEED,
+                "accuracy_base": ACCURACY_BASE
+            },
+            "recent_shots": recent_shots,
+            "shooting_statistics": self.get_shooting_statistics(),
+            "battle_summary": self.get_battle_summary()
+        }
+
+
+# Вспомогательные функции для создания демо-данных с снарядами
+def create_demo_battle_with_projectiles(steps: int = 50) -> List[Dict[str, Any]]:
+    """Создает демонстрационные данные боя с системой снарядов"""
+    
+    env = ArenaEnv({
+        "ally_choices": [2],
+        "enemy_choices": [2], 
+        "episode_len": steps
+    })
+    
+    obs, _ = env.reset()
+    frames = []
+    
+    for step in range(steps):
+        # Генерируем случайные действия с упором на стрельбу
+        actions = {}
+        for agent_id in obs.keys():
+            actions[agent_id] = {
+                "target": np.random.randint(0, env.max_enemies),
+                "move": np.random.uniform(-0.3, 0.3, 3),  # 3D движение
+                "aim": np.random.uniform(-0.4, 0.4, 3),   # 3D прицеливание  
+                "fire": 1 if np.random.random() < 0.2 else 0,  # 20% шанс выстрела
+            }
+        
+        obs, rewards, terms, truncs, infos = env.step(actions)
+        
+        # Экспортируем кадр для визуализатора
+        frame_data = env.export_battle_data_for_visualization()
+        frame_data["step"] = step
+        frames.append(frame_data)
+        
+        if terms.get("__all__") or truncs.get("__all__"):
+            break
+    
+    return frames
+
+
+def test_projectile_system():
+    """Тестирует новую систему снарядов"""
+    print("🚀 Testing Enhanced Projectile System")
+    print("=" * 40)
+    
+    # Создаем окружение
+    env = ArenaEnv({
+        "ally_choices": [2],
+        "enemy_choices": [2],
+        "episode_len": 20
+    })
+    
+    obs, _ = env.reset()
+    print(f"✅ Environment initialized with {len(obs)} agents")
+    print(f"   Field bounds: {env.FIELD_BOUNDS}")
+    print(f"   Laser range: {env.LASER_MAX_RANGE}")
+    print(f"   Projectile speed: {env.PROJECTILE_SPEED}")
+    
+    # Симулируем несколько шагов с выстрелами
+    for step in range(10):
+        actions = {}
+        for agent_id in obs.keys():
+            # Повышенная вероятность стрельбы для тестирования
+            actions[agent_id] = {
+                "target": 0,  # Всегда стреляем в первого врага
+                "move": np.random.uniform(-0.2, 0.2, 3),
+                "aim": np.random.uniform(-0.3, 0.3, 3),
+                "fire": 1 if np.random.random() < 0.4 else 0,  # 40% шанс
+            }
+        
+        obs, rewards, terms, truncs, infos = env.step(actions)
+        
+        # Показываем статистику каждые несколько шагов
+        if step % 3 == 0:
+            stats = env.get_shooting_statistics()
+            print(f"\nStep {step}: Shooting Statistics")
+            print(f"  Total shots: {stats['total_shots']}")
+            print(f"  Hits: {stats['shots_hit']}")
+            print(f"  Hit rate: {stats['hit_rate']:.2%}")
+            print(f"  Avg accuracy: {stats['average_accuracy']:.2%}")
+            print(f"  Recent shots tracked: {stats['recent_shots']}")
+        
+        if terms.get("__all__") or truncs.get("__all__"):
+            print(f"\n🏁 Battle ended at step {step}")
+            break
+    
+    # Финальная статистика
+    final_stats = env.get_shooting_statistics()
+    battle_summary = env.get_battle_summary()
+    
+    print(f"\n📊 Final Battle Results:")
+    print(f"  Duration: {battle_summary['step']} steps")
+    print(f"  Red team: {battle_summary['red_alive']}/{battle_summary['red_agents']} alive")
+    print(f"  Blue team: {battle_summary['blue_alive']}/{battle_summary['blue_agents']} alive") 
+    print(f"  Boundary deaths: {battle_summary['boundary_deaths']}")
+    
+    print(f"\n🎯 Projectile System Performance:")
+    print(f"  Total projectiles fired: {final_stats['total_shots']}")
+    print(f"  Successful hits: {final_stats['shots_hit']}")
+    print(f"  Misses: {final_stats['shots_missed']}")
+    print(f"  Overall hit rate: {final_stats['hit_rate']:.2%}")
+    print(f"  Average accuracy: {final_stats['average_accuracy']:.2%}")
+    print(f"  Projectile system: {final_stats['projectile_system_enabled']}")
+    
+    # Тест экспорта данных
+    export_data = env.export_battle_data_for_visualization()
+    print(f"\n📤 Export test:")
+    print(f"  Robots in export: {len(export_data['robots'])}")
+    print(f"  Recent shots: {len(export_data['recent_shots'])}")
+    print(f"  Laser config included: {'laser_config' in export_data}")
+    
+    print(f"\n✅ Projectile system test completed successfully!")
+    return True
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "test":
+            test_projectile_system()
+        elif sys.argv[1] == "demo":
+            print("🎮 Creating demo battle data with projectiles...")
+            frames = create_demo_battle_with_projectiles(30)
+            print(f"✅ Generated {len(frames)} frames with projectile system")
+            
+            # Показываем статистику по выстрелам
+            total_shots = sum(len(frame.get("recent_shots", [])) for frame in frames)
+            print(f"📊 Demo statistics:")
+            print(f"  Total shots tracked: {total_shots}")
+            print(f"  Frames with shooting: {sum(1 for f in frames if f.get('recent_shots'))}")
+            print(f"  Enhanced 3D features: ✅")
+            
+        else:
+            print("Usage:")
+            print("  python arena_env.py test - Test projectile system")
+            print("  python arena_env.py demo - Create demo data")
+    else:
+        print("🌟 Enhanced Arena Environment with Projectile System loaded!")
+        print("   Features:")
+        print("   - 3D movement and positioning")
+        print("   - Field boundaries with death penalties") 
+        print("   - Laser range limitations")
+        print("   - Realistic projectile ballistics")
+        print("   - Accuracy-based hit system")
+        print("   - Detailed shooting statistics")
+        print("   - Export support for 3D visualizer")
+        print("\n   Use 'test' or 'demo' arguments to run examples.")

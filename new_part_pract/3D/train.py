@@ -242,7 +242,7 @@ def main():
             num_workers = 4
             train_batch_size = 16384
             iterations = args.iterations
-            export_every = 1
+            export_every = 25
             recording_freq = 5
         
         # Обновляем env_config с правильными размерами
