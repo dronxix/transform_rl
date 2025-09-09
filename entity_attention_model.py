@@ -1,16 +1,118 @@
 """
-ONNX-совместимая версия EntityAttentionModel
-Заменяет nn.MultiheadAttention на кастомную реализацию
+ONNX-совместимая версия EntityAttentionModel для универсальных actions/obs
+Автоматически адаптируется к любым форматам действий и наблюдений
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Union
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models import ModelCatalog
 import math
+from collections import OrderedDict
+
+class DynamicActionConfig:
+    """Конфигурация для автоматического определения структуры действий"""
+    
+    def __init__(self, action_space=None, model_config=None):
+        self.action_space = action_space
+        self.model_config = model_config or {}
+        self.action_spec = self._analyze_action_space()
+        
+    def _analyze_action_space(self) -> Dict[str, Any]:
+        """Анализирует action_space и создает универсальную спецификацию"""
+        if self.action_space is None:
+            # Дефолтная конфигурация
+            return {
+                "discrete_actions": {"target": 6},
+                "continuous_actions": {"move": 3, "aim": 3},
+                "binary_actions": {"fire": 1},
+                "total_output_size": 6 + 3 + 3 + 3 + 3 + 1  # target + move + move_std + aim + aim_std + fire
+            }
+        
+        spec = {
+            "discrete_actions": {},
+            "continuous_actions": {},
+            "binary_actions": {},
+            "total_output_size": 0
+        }
+        
+        if hasattr(self.action_space, 'spaces'):
+            # Dict action space
+            for name, space in self.action_space.spaces.items():
+                if hasattr(space, 'n'):
+                    # Discrete space
+                    spec["discrete_actions"][name] = space.n
+                    spec["total_output_size"] += space.n
+                elif hasattr(space, 'shape'):
+                    # Continuous space
+                    action_dim = space.shape[0] if space.shape else 1
+                    if name in ["fire", "shoot", "attack"] or action_dim == 1:
+                        spec["binary_actions"][name] = 1
+                        spec["total_output_size"] += 1
+                    else:
+                        spec["continuous_actions"][name] = action_dim
+                        spec["total_output_size"] += action_dim * 2  # mu + log_std
+        else:
+            # Single action space - используем дефолт
+            pass
+            
+        return spec
+
+class DynamicObservationProcessor:
+    """Процессор для автоматической обработки различных форматов наблюдений"""
+    
+    def __init__(self, obs_space=None, model_config=None):
+        self.obs_space = obs_space
+        self.model_config = model_config or {}
+        self.obs_spec = self._analyze_observation_space()
+        
+    def _analyze_observation_space(self) -> Dict[str, Any]:
+        """Анализирует observation_space и создает спецификацию"""
+        if self.obs_space is None:
+            return self._default_obs_spec()
+            
+        spec = {
+            "self_features": 13,  # Дефолт для 3D
+            "ally_features": 9,
+            "enemy_features": 11,
+            "global_features": 64,
+            "max_allies": 6,
+            "max_enemies": 6,
+            "additional_features": {}
+        }
+        
+        if hasattr(self.obs_space, 'spaces'):
+            for name, space in self.obs_space.spaces.items():
+                if name == "self":
+                    spec["self_features"] = space.shape[0]
+                elif name == "allies":
+                    spec["max_allies"] = space.shape[0]
+                    spec["ally_features"] = space.shape[1]
+                elif name == "enemies":
+                    spec["max_enemies"] = space.shape[0]
+                    spec["enemy_features"] = space.shape[1]
+                elif name == "global_state":
+                    spec["global_features"] = space.shape[0]
+                elif name not in ["allies_mask", "enemies_mask", "enemy_action_mask"]:
+                    # Дополнительные признаки
+                    spec["additional_features"][name] = space.shape
+                    
+        return spec
+    
+    def _default_obs_spec(self):
+        """Дефолтная спецификация наблюдений для обратной совместимости"""
+        return {
+            "self_features": 13,
+            "ally_features": 9,
+            "enemy_features": 11,
+            "global_features": 64,
+            "max_allies": 6,
+            "max_enemies": 6,
+            "additional_features": {}
+        }
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 256):
@@ -22,7 +124,7 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
         
-    def forward(self, x):  # [B,L,D]
+    def forward(self, x):
         pe = self.pe.to(x.device)
         return x + pe[:, :x.size(1), :]
 
@@ -39,7 +141,8 @@ class MLP(nn.Module):
         self.net = nn.Sequential(*layers)
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
                 
     def forward(self, x): 
         return self.net(x)
@@ -55,7 +158,6 @@ class ONNXCompatibleMultiHeadAttention(nn.Module):
         self.nhead = nhead
         self.d_k = d_model // nhead
         
-        # Отдельные проекции вместо in_proj
         self.w_q = nn.Linear(d_model, d_model, bias=False)
         self.w_k = nn.Linear(d_model, d_model, bias=False)
         self.w_v = nn.Linear(d_model, d_model, bias=False)
@@ -67,42 +169,31 @@ class ONNXCompatibleMultiHeadAttention(nn.Module):
     def forward(self, query, key, value, key_padding_mask=None, need_weights=False):
         batch_size, seq_len, d_model = query.size()
         
-        # Проекции Q, K, V
-        Q = self.w_q(query)  # [B, L, D]
-        K = self.w_k(key)    # [B, L, D]
-        V = self.w_v(value)  # [B, L, D]
+        Q = self.w_q(query)
+        K = self.w_k(key)
+        V = self.w_v(value)
         
-        # Reshape для multi-head: [B, L, D] -> [B, H, L, D/H]
         Q = Q.view(batch_size, seq_len, self.nhead, self.d_k).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.nhead, self.d_k).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.nhead, self.d_k).transpose(1, 2)
         
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, H, L, L]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         
-        # Применяем маску если есть
         if key_padding_mask is not None:
-            # key_padding_mask: [B, L], True = ignore
-            # Расширяем для всех голов: [B, 1, 1, L]
             mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
             scores = scores.masked_fill(mask, float('-inf'))
         
-        attn_weights = F.softmax(scores, dim=-1)  # [B, H, L, L]
+        attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        # Применяем внимание к values
-        attn_output = torch.matmul(attn_weights, V)  # [B, H, L, D/H]
-        
-        # Concat heads: [B, H, L, D/H] -> [B, L, D]
+        attn_output = torch.matmul(attn_weights, V)
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, seq_len, d_model)
         
-        # Финальная проекция
         output = self.w_o(attn_output)
         
         if need_weights:
-            # Усредняем веса по головам для совместимости
-            avg_weights = attn_weights.mean(dim=1)  # [B, L, L]
+            avg_weights = attn_weights.mean(dim=1)
             return output, avg_weights
         else:
             return output, None
@@ -122,19 +213,110 @@ class ONNXCompatibleAttnBlock(nn.Module):
         self.last_attn = None
         
     def forward(self, x, key_padding_mask):
-        # Self-attention
         attn_out, attn_w = self.mha(x, x, x, key_padding_mask=key_padding_mask, need_weights=True)
         self.last_attn = attn_w
         x = self.ln1(x + attn_out)
         
-        # Feed-forward
         ff_out = self.ff(x)
         x = self.ln2(x + ff_out)
         
         return x
 
+class UniversalActionHead(nn.Module):
+    """Универсальная голова для любых типов действий"""
+    
+    def __init__(self, d_model: int, action_config: DynamicActionConfig, hidden: int = 256):
+        super().__init__()
+        self.action_config = action_config
+        self.action_spec = action_config.action_spec
+        
+        # Создаем головы для разных типов действий
+        self.discrete_heads = nn.ModuleDict()
+        self.continuous_heads = nn.ModuleDict()
+        self.continuous_logstd = nn.ParameterDict()
+        self.binary_heads = nn.ModuleDict()
+        
+        # Дискретные действия
+        for name, n_classes in self.action_spec["discrete_actions"].items():
+            self.discrete_heads[name] = MLP([d_model, hidden, n_classes])
+        
+        # Непрерывные действия
+        for name, action_dim in self.action_spec["continuous_actions"].items():
+            self.continuous_heads[name] = MLP([d_model, hidden, action_dim])
+            self.continuous_logstd[name] = nn.Parameter(torch.full((action_dim,), -0.5))
+        
+        # Бинарные действия
+        for name, _ in self.action_spec["binary_actions"].items():
+            self.binary_heads[name] = MLP([d_model, hidden, 1])
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Возвращает словарь с логитами для каждого действия"""
+        outputs = {}
+        
+        # Дискретные действия
+        for name, head in self.discrete_heads.items():
+            outputs[f"{name}_logits"] = head(x)
+        
+        # Непрерывные действия
+        for name, head in self.continuous_heads.items():
+            mu = head(x)
+            log_std = self.continuous_logstd[name].clamp(-5.0, 2.0).expand_as(mu)
+            outputs[f"{name}_mu"] = mu
+            outputs[f"{name}_log_std"] = log_std
+        
+        # Бинарные действия
+        for name, head in self.binary_heads.items():
+            outputs[f"{name}_logit"] = head(x)
+        
+        return outputs
+
+class UniversalObservationEncoder(nn.Module):
+    """Универсальный энкодер для различных форматов наблюдений"""
+    
+    def __init__(self, obs_processor: DynamicObservationProcessor, d_model: int = 128):
+        super().__init__()
+        self.obs_processor = obs_processor
+        self.obs_spec = obs_processor.obs_spec
+        self.d_model = d_model
+        
+        # Основные энкодеры
+        self.self_enc = MLP([self.obs_spec["self_features"], d_model])
+        self.ally_enc = MLP([self.obs_spec["ally_features"], d_model])
+        self.enemy_enc = MLP([self.obs_spec["enemy_features"], d_model])
+        
+        # Энкодеры для дополнительных признаков
+        self.additional_encoders = nn.ModuleDict()
+        for name, shape in self.obs_spec["additional_features"].items():
+            input_size = np.prod(shape) if isinstance(shape, tuple) else shape
+            self.additional_encoders[name] = MLP([input_size, d_model])
+    
+    def forward(self, obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Кодирует наблюдения в токены"""
+        encoded = {}
+        
+        # Основные компоненты
+        if "self" in obs:
+            encoded["self"] = self.self_enc(obs["self"])
+        
+        if "allies" in obs:
+            encoded["allies"] = self.ally_enc(obs["allies"])
+        
+        if "enemies" in obs:
+            encoded["enemies"] = self.enemy_enc(obs["enemies"])
+        
+        # Дополнительные компоненты
+        for name, encoder in self.additional_encoders.items():
+            if name in obs:
+                # Flatten если нужно
+                x = obs[name]
+                if x.dim() > 2:
+                    x = x.view(x.size(0), -1)
+                encoded[name] = encoder(x)
+        
+        return encoded
+
 class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
-    """ONNX-совместимая версия EntityAttentionModel"""
+    """Универсальная ONNX-совместимая модель для любых action/obs форматов"""
     
     def __init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
@@ -142,59 +324,52 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
 
         cfg = model_config.get("custom_model_config", {})
         d_model = int(cfg.get("d_model", 160))
-        nhead   = int(cfg.get("nhead", 8))
-        layers  = int(cfg.get("layers", 2))
-        ff      = int(cfg.get("ff", 320))
-        hidden  = int(cfg.get("hidden", 256))
+        nhead = int(cfg.get("nhead", 8))
+        layers = int(cfg.get("layers", 2))
+        ff = int(cfg.get("ff", 320))
+        hidden = int(cfg.get("hidden", 256))
         self.logstd_min = float(cfg.get("logstd_min", -5.0))
         self.logstd_max = float(cfg.get("logstd_max", 2.0))
 
-        # Извлекаем размеры
-        if hasattr(obs_space, 'spaces'):
-            self_feats = obs_space["self"].shape[0]
-            allies_shape = obs_space["allies"].shape
-            enemies_shape = obs_space["enemies"].shape
-            self.max_allies = allies_shape[0]
-            self.max_enemies = enemies_shape[0]
-            ally_feats = allies_shape[1]
-            enemy_feats = enemies_shape[1]
-            global_feats = obs_space["global_state"].shape[0]
-        else:
-            self.max_allies = int(cfg.get("max_allies", 6))
-            self.max_enemies = int(cfg.get("max_enemies", 6))
-            self_feats = 12
-            ally_feats = 8
-            enemy_feats = 10
-            global_feats = 64
+        # Создаем конфигурации для универсальной обработки
+        self.action_config = DynamicActionConfig(action_space, model_config)
+        self.obs_processor = DynamicObservationProcessor(obs_space, model_config)
+        
+        print(f"🔧 Universal Model Configuration:")
+        print(f"   Actions: {self.action_config.action_spec}")
+        print(f"   Observations: {self.obs_processor.obs_spec}")
 
         # Сохраняем для экспорта
         self.d_model = d_model
         self.nhead = nhead
         self.layers = layers
+        self.max_allies = self.obs_processor.obs_spec["max_allies"]
+        self.max_enemies = self.obs_processor.obs_spec["max_enemies"]
 
-        # Энкодеры
-        self.self_enc  = MLP([self_feats, d_model])
-        self.ally_enc  = MLP([ally_feats, d_model])
-        self.enemy_enc = MLP([enemy_feats, d_model])
-
-        # ONNX-совместимые блоки
-        self.posenc = PositionalEncoding(d_model, max_len=max(self.max_allies + self.max_enemies + 1, 64))
+        # Универсальный энкодер наблюдений
+        self.obs_encoder = UniversalObservationEncoder(self.obs_processor, d_model)
+        
+        # Attention система
+        max_seq_len = max(self.max_allies + self.max_enemies + 1, 64)
+        self.posenc = PositionalEncoding(d_model, max_len=max_seq_len)
         self.blocks = nn.ModuleList([
             ONNXCompatibleAttnBlock(d_model, nhead, ff) for _ in range(layers)
         ])
         self.norm = nn.LayerNorm(d_model)
         self.last_attn = None
 
-        # Политические головы
-        self.head_target     = MLP([d_model, hidden, self.max_enemies])
-        self.head_move_mu    = MLP([d_model, hidden, 2])
-        self.head_aim_mu     = MLP([d_model, hidden, 2])
-        self.log_std_move    = nn.Parameter(torch.full((2,), -0.5))
-        self.log_std_aim     = nn.Parameter(torch.full((2,), -0.5))
-        self.head_fire_logit = MLP([d_model, hidden, 1])
-
-        # Централизованная value
-        self.value_net = MLP([global_feats, hidden, 1])
+        # Универсальная голова действий
+        self.action_head = UniversalActionHead(d_model, self.action_config, hidden)
+        
+        # Value function - адаптируется к глобальным признакам
+        global_feats = self.obs_processor.obs_spec["global_features"]
+        additional_feats = sum(
+            np.prod(shape) if isinstance(shape, tuple) else shape 
+            for shape in self.obs_processor.obs_spec["additional_features"].values()
+        )
+        total_value_feats = global_feats + additional_feats
+        
+        self.value_net = MLP([total_value_feats, hidden, 1])
         self._value_out: Optional[torch.Tensor] = None
 
     def _ensure_tensor_device(self, tensor, target_device):
@@ -224,6 +399,80 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
                 
         return obs_fixed, target_device
 
+    def _build_attention_sequence(self, encoded_obs: Dict[str, torch.Tensor], obs: Dict[str, torch.Tensor], target_device):
+        """Строит последовательность для attention с учетом всех типов наблюдений"""
+        sequence_parts = []
+        mask_parts = []
+        batch_size = next(iter(encoded_obs.values())).size(0)
+        
+        # Self токен (всегда первый)
+        if "self" in encoded_obs:
+            sequence_parts.append(encoded_obs["self"].unsqueeze(1))
+            mask_parts.append(torch.zeros(batch_size, 1, dtype=torch.bool, device=target_device))
+        
+        # Allies
+        if "allies" in encoded_obs:
+            sequence_parts.append(encoded_obs["allies"])
+            allies_mask = obs.get("allies_mask", torch.ones(batch_size, self.max_allies, device=target_device))
+            mask_parts.append(~(allies_mask > 0))
+        
+        # Enemies
+        if "enemies" in encoded_obs:
+            sequence_parts.append(encoded_obs["enemies"])
+            enemies_mask = obs.get("enemies_mask", torch.ones(batch_size, self.max_enemies, device=target_device))
+            mask_parts.append(~(enemies_mask > 0))
+        
+        # Дополнительные наблюдения как отдельные токены
+        for name, encoded_feat in encoded_obs.items():
+            if name not in ["self", "allies", "enemies"]:
+                # Добавляем как single token
+                if encoded_feat.dim() == 2:  # [B, D]
+                    sequence_parts.append(encoded_feat.unsqueeze(1))
+                    mask_parts.append(torch.zeros(batch_size, 1, dtype=torch.bool, device=target_device))
+                elif encoded_feat.dim() == 3:  # [B, L, D]
+                    sequence_parts.append(encoded_feat)
+                    seq_len = encoded_feat.size(1)
+                    mask_parts.append(torch.zeros(batch_size, seq_len, dtype=torch.bool, device=target_device))
+        
+        # Объединяем
+        if sequence_parts:
+            x = torch.cat(sequence_parts, dim=1)
+            pad_mask = torch.cat(mask_parts, dim=1)
+        else:
+            # Fallback - создаем пустую последовательность
+            x = torch.zeros(batch_size, 1, self.d_model, device=target_device)
+            pad_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=target_device)
+        
+        return x, pad_mask
+
+    def _flatten_action_outputs(self, action_outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Преобразует словарь выходов действий в плоский тензор для совместимости с RLLib"""
+        flat_parts = []
+        
+        # Собираем в определенном порядке для консистентности
+        # 1. Дискретные действия
+        for name in sorted(self.action_config.action_spec["discrete_actions"].keys()):
+            if f"{name}_logits" in action_outputs:
+                flat_parts.append(action_outputs[f"{name}_logits"])
+        
+        # 2. Непрерывные действия (mu, затем log_std)
+        for name in sorted(self.action_config.action_spec["continuous_actions"].keys()):
+            if f"{name}_mu" in action_outputs:
+                flat_parts.append(action_outputs[f"{name}_mu"])
+                flat_parts.append(action_outputs[f"{name}_log_std"])
+        
+        # 3. Бинарные действия
+        for name in sorted(self.action_config.action_spec["binary_actions"].keys()):
+            if f"{name}_logit" in action_outputs:
+                flat_parts.append(action_outputs[f"{name}_logit"])
+        
+        if flat_parts:
+            return torch.cat(flat_parts, dim=-1)
+        else:
+            # Fallback - возвращаем пустой тензор
+            batch_size = 1  # Попытаемся определить из context
+            return torch.zeros(batch_size, 1, device=next(self.parameters()).device)
+
     def forward(self, input_dict, state, seq_lens):
         raw_obs = input_dict["obs"]
         
@@ -236,19 +485,12 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         obs, target_device = self._ensure_obs_device_consistency(obs)
         
         try:
-            # Энкодинг токенов
-            self_tok   = self.self_enc(obs["self"])
-            allies_tok = self.ally_enc(obs["allies"])
-            enemies_tok= self.enemy_enc(obs["enemies"])
-            x = torch.cat([self_tok.unsqueeze(1), allies_tok, enemies_tok], dim=1)
-
-            # Паддинг-маска
-            B = x.size(0)
-            pad_self = torch.zeros(B, 1, dtype=torch.bool, device=target_device)
-            am = obs["allies_mask"] > 0
-            em = obs["enemies_mask"] > 0
-            pad_mask = torch.cat([pad_self, ~am, ~em], dim=1)
-
+            # Кодируем наблюдения
+            encoded_obs = self.obs_encoder(obs)
+            
+            # Строим последовательность для attention
+            x, pad_mask = self._build_attention_sequence(encoded_obs, obs, target_device)
+            
             # Positional encoding + attention блоки
             x = self.posenc(x)
             for blk in self.blocks:
@@ -256,36 +498,63 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
             self.last_attn = self.blocks[-1].last_attn if self.blocks else None
             x = self.norm(x)
 
-            # Self-токен как агрегат
+            # Self-токен как агрегат (первый токен)
             h = x[:, 0, :]
 
-            # Политические головы
-            logits_target = self.head_target(h)
-            mask = obs["enemy_action_mask"].float()
-            inf_mask = (1.0 - mask) * torch.finfo(logits_target.dtype).min
-            masked_logits = logits_target + inf_mask
+            # Генерируем действия через универсальную голову
+            action_outputs = self.action_head(h)
+            
+            # Применяем маски для дискретных действий если есть
+            if "target_logits" in action_outputs and "enemy_action_mask" in obs:
+                mask = obs["enemy_action_mask"].float()
+                inf_mask = (1.0 - mask) * torch.finfo(action_outputs["target_logits"].dtype).min
+                action_outputs["target_logits"] = action_outputs["target_logits"] + inf_mask
 
-            mu_move = self.head_move_mu(h)
-            mu_aim  = self.head_aim_mu(h)
-            log_std_move = self.log_std_move.clamp(self.logstd_min, self.logstd_max).expand_as(mu_move)
-            log_std_aim  = self.log_std_aim .clamp(self.logstd_min, self.logstd_max).expand_as(mu_aim)
-            logit_fire   = self.head_fire_logit(h)
+            # Преобразуем в плоский формат для RLLib
+            out = self._flatten_action_outputs(action_outputs)
 
-            # Склейка
-            out = torch.cat([masked_logits, mu_move, log_std_move, mu_aim, log_std_aim, logit_fire], dim=-1)
-
-            # Централизованная V
-            v = self.value_net(obs["global_state"]).squeeze(-1)
+            # Value function - собираем все доступные глобальные признаки
+            value_inputs = []
+            if "global_state" in obs:
+                value_inputs.append(obs["global_state"])
+            
+            # Добавляем дополнительные признаки для value function
+            for name in self.obs_processor.obs_spec["additional_features"]:
+                if name in obs and name != "global_state":
+                    feat = obs[name]
+                    if feat.dim() > 2:
+                        feat = feat.view(feat.size(0), -1)
+                    value_inputs.append(feat)
+            
+            if value_inputs:
+                value_input = torch.cat(value_inputs, dim=-1)
+            else:
+                # Fallback - используем self признаки
+                value_input = obs.get("self", torch.zeros(h.size(0), 1, device=target_device))
+            
+            v = self.value_net(value_input).squeeze(-1)
             self._value_out = v
             
             return out, state
             
         except Exception as e:
-            print(f"ERROR in ONNX model forward: {e}")
+            print(f"ERROR in Universal model forward: {e}")
+            print(f"Observation keys: {list(obs.keys())}")
+            print(f"Observation shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in obs.items()]}")
             raise
 
     def value_function(self):
         return self._value_out
 
-# Регистрируем ONNX-совместимую модель
+    def get_action_spec(self):
+        """Возвращает спецификацию действий для дистрибуции"""
+        return self.action_config.action_spec
+
+    def get_obs_spec(self):
+        """Возвращает спецификацию наблюдений"""
+        return self.obs_processor.obs_spec
+
+# Регистрируем универсальную модель
+ModelCatalog.register_custom_model("entity_attention", ONNXEntityAttentionModel)
 ModelCatalog.register_custom_model("onnx_entity_attention", ONNXEntityAttentionModel)
+ModelCatalog.register_custom_model("universal_entity_attention", ONNXEntityAttentionModel)
