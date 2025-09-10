@@ -1,6 +1,7 @@
 """
-ONNX-совместимая версия EntityAttentionModel
+ONNX-совместимая версия EntityAttentionModel для 3D пространства
 Заменяет nn.MultiheadAttention на кастомную реализацию
+Обновлено для работы с 3D координатами и действиями
 """
 
 import numpy as np
@@ -134,7 +135,7 @@ class ONNXCompatibleAttnBlock(nn.Module):
         return x
 
 class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
-    """ONNX-совместимая версия EntityAttentionModel"""
+    """ONNX-совместимая версия EntityAttentionModel для 3D пространства"""
     
     def __init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
@@ -149,7 +150,7 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         self.logstd_min = float(cfg.get("logstd_min", -5.0))
         self.logstd_max = float(cfg.get("logstd_max", 2.0))
 
-        # Извлекаем размеры
+        # Извлекаем размеры для 3D
         if hasattr(obs_space, 'spaces'):
             self_feats = obs_space["self"].shape[0]
             allies_shape = obs_space["allies"].shape
@@ -162,9 +163,10 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         else:
             self.max_allies = int(cfg.get("max_allies", 6))
             self.max_enemies = int(cfg.get("max_enemies", 6))
-            self_feats = 12
-            ally_feats = 8
-            enemy_feats = 10
+            # Обновленные размеры для 3D
+            self_feats = 13   # Было 12, теперь +1 для Z координаты
+            ally_feats = 9    # Было 8, теперь +1 для Z координаты
+            enemy_feats = 11  # Было 10, теперь +1 для Z координаты
             global_feats = 64
 
         # Сохраняем для экспорта
@@ -172,11 +174,14 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         self.nhead = nhead
         self.layers = layers
 
-        # Энкодеры
+        # Энкодеры для 3D данных
         self.self_enc  = MLP([self_feats, d_model])
         self.ally_enc  = MLP([ally_feats, d_model])
         self.enemy_enc = MLP([enemy_feats, d_model])
 
+        # Дополнительный энкодер для 3D пространственных признаков
+        self.spatial_3d_enc = MLP([3, d_model // 4])  # Для кодирования 3D позиций отдельно
+        
         # ONNX-совместимые блоки
         self.posenc = PositionalEncoding(d_model, max_len=max(self.max_allies + self.max_enemies + 1, 64))
         self.blocks = nn.ModuleList([
@@ -185,16 +190,24 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.last_attn = None
 
-        # Политические головы
+        # Политические головы для 3D действий
         self.head_target     = MLP([d_model, hidden, self.max_enemies])
-        self.head_move_mu    = MLP([d_model, hidden, 2])
-        self.head_aim_mu     = MLP([d_model, hidden, 2])
-        self.log_std_move    = nn.Parameter(torch.full((2,), -0.5))
-        self.log_std_aim     = nn.Parameter(torch.full((2,), -0.5))
+        
+        # 3D движение (x, y, z)
+        self.head_move_mu    = MLP([d_model, hidden, 3])  # Теперь 3D
+        self.log_std_move    = nn.Parameter(torch.full((3,), -0.5))  # 3D log std
+        
+        # 3D прицеливание (x, y, z)
+        self.head_aim_mu     = MLP([d_model, hidden, 3])  # Теперь 3D
+        self.log_std_aim     = nn.Parameter(torch.full((3,), -0.5))  # 3D log std
+        
         self.head_fire_logit = MLP([d_model, hidden, 1])
 
-        # Централизованная value
-        self.value_net = MLP([global_feats, hidden, 1])
+        # Дополнительные головы для 3D информации
+        self.head_3d_awareness = MLP([d_model, hidden // 2, 3])  # Понимание 3D окружения
+        
+        # Централизованная value с учетом 3D пространства
+        self.value_net = MLP([global_feats + 3, hidden, 1])  # +3 для дополнительной 3D информации
         self._value_out: Optional[torch.Tensor] = None
 
     def _ensure_tensor_device(self, tensor, target_device):
@@ -224,6 +237,44 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
                 
         return obs_fixed, target_device
 
+    def _extract_3d_spatial_features(self, obs, target_device):
+        """Извлекает и обрабатывает 3D пространственные признаки"""
+        batch_size = obs["self"].shape[0]
+        
+        # Извлекаем 3D позицию из self наблюдений (первые 3 компонента)
+        self_3d_pos = obs["self"][:, :3]  # [B, 3] - x, y, z позиция
+        
+        # Кодируем 3D позицию отдельно
+        spatial_encoding = self.spatial_3d_enc(self_3d_pos)  # [B, d_model//4]
+        
+        # Вычисляем 3D метрики окружения
+        allies_3d = obs["allies"][:, :, :3]  # [B, max_allies, 3]
+        enemies_3d = obs["enemies"][:, :, :3]  # [B, max_enemies, 3]
+        
+        # Средние расстояния в 3D
+        allies_mask = obs["allies_mask"].float().unsqueeze(-1)  # [B, max_allies, 1]
+        enemies_mask = obs["enemies_mask"].float().unsqueeze(-1)  # [B, max_enemies, 1]
+        
+        # Расстояния до союзников и врагов в 3D
+        allies_distances = torch.norm(allies_3d, dim=-1, keepdim=True)  # [B, max_allies, 1]
+        enemies_distances = torch.norm(enemies_3d, dim=-1, keepdim=True)  # [B, max_enemies, 1]
+        
+        # Средние расстояния с учетом масок
+        avg_ally_dist = (allies_distances * allies_mask).sum(dim=1) / (allies_mask.sum(dim=1) + 1e-8)
+        avg_enemy_dist = (enemies_distances * enemies_mask).sum(dim=1) / (enemies_mask.sum(dim=1) + 1e-8)
+        
+        # Высота относительно поля (z-координата)
+        relative_height = self_3d_pos[:, 2:3] / 6.0  # Нормализуем к высоте поля
+        
+        # Дополнительные 3D признаки
+        spatial_features = torch.cat([
+            avg_ally_dist,     # [B, 1]
+            avg_enemy_dist,    # [B, 1] 
+            relative_height    # [B, 1]
+        ], dim=-1)  # [B, 3]
+        
+        return spatial_encoding, spatial_features
+
     def forward(self, input_dict, state, seq_lens):
         raw_obs = input_dict["obs"]
         
@@ -236,10 +287,19 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
         obs, target_device = self._ensure_obs_device_consistency(obs)
         
         try:
-            # Энкодинг токенов
+            # Извлекаем 3D пространственные признаки
+            spatial_encoding, spatial_features = self._extract_3d_spatial_features(obs, target_device)
+            
+            # Энкодинг токенов с учетом 3D
             self_tok   = self.self_enc(obs["self"])
             allies_tok = self.ally_enc(obs["allies"])
             enemies_tok= self.enemy_enc(obs["enemies"])
+            
+            # Добавляем пространственное кодирование к self токену
+            self_tok = self_tok + torch.cat([spatial_encoding, torch.zeros(spatial_encoding.shape[0], 
+                                           self_tok.shape[1] - spatial_encoding.shape[1], 
+                                           device=target_device)], dim=1)
+            
             x = torch.cat([self_tok.unsqueeze(1), allies_tok, enemies_tok], dim=1)
 
             # Паддинг-маска
@@ -259,33 +319,57 @@ class ONNXEntityAttentionModel(TorchModelV2, nn.Module):
             # Self-токен как агрегат
             h = x[:, 0, :]
 
-            # Политические головы
+            # Политические головы для 3D действий
             logits_target = self.head_target(h)
             mask = obs["enemy_action_mask"].float()
             inf_mask = (1.0 - mask) * torch.finfo(logits_target.dtype).min
             masked_logits = logits_target + inf_mask
 
-            mu_move = self.head_move_mu(h)
-            mu_aim  = self.head_aim_mu(h)
+            # 3D движение
+            mu_move = self.head_move_mu(h)  # [B, 3] для x, y, z
             log_std_move = self.log_std_move.clamp(self.logstd_min, self.logstd_max).expand_as(mu_move)
-            log_std_aim  = self.log_std_aim .clamp(self.logstd_min, self.logstd_max).expand_as(mu_aim)
-            logit_fire   = self.head_fire_logit(h)
+            
+            # 3D прицеливание
+            mu_aim = self.head_aim_mu(h)   # [B, 3] для x, y, z
+            log_std_aim = self.log_std_aim.clamp(self.logstd_min, self.logstd_max).expand_as(mu_aim)
+            
+            # Огонь
+            logit_fire = self.head_fire_logit(h)
+            
+            # 3D осведомленность (дополнительная информация о пространстве)
+            awareness_3d = self.head_3d_awareness(h)
 
-            # Склейка
-            out = torch.cat([masked_logits, mu_move, log_std_move, mu_aim, log_std_aim, logit_fire], dim=-1)
+            # Склейка (увеличенный размер для 3D)
+            out = torch.cat([
+                masked_logits,      # target selection
+                mu_move,           # 3D movement (3 values)
+                log_std_move,      # 3D movement std (3 values)
+                mu_aim,            # 3D aiming (3 values)
+                log_std_aim,       # 3D aiming std (3 values)
+                logit_fire,        # fire decision (1 value)
+                awareness_3d       # 3D spatial awareness (3 values)
+            ], dim=-1)
 
-            # Централизованная V
-            v = self.value_net(obs["global_state"]).squeeze(-1)
+            # Централизованная V с 3D информацией
+            global_with_3d = torch.cat([obs["global_state"], spatial_features], dim=-1)
+            v = self.value_net(global_with_3d).squeeze(-1)
             self._value_out = v
             
             return out, state
             
         except Exception as e:
-            print(f"ERROR in ONNX model forward: {e}")
+            print(f"ERROR in 3D ONNX model forward: {e}")
+            print(f"Observation shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in obs.items()]}")
             raise
 
     def value_function(self):
         return self._value_out
 
-# Регистрируем ONNX-совместимую модель
+    def get_3d_action_dim(self):
+        """Возвращает размерность 3D действий для совместимости"""
+        # target + move(3) + move_std(3) + aim(3) + aim_std(3) + fire + awareness(3)
+        return self.max_enemies + 3 + 3 + 3 + 3 + 1 + 3
+
+# Регистрируем ONNX-совместимую 3D модель
 ModelCatalog.register_custom_model("onnx_entity_attention", ONNXEntityAttentionModel)
+ModelCatalog.register_custom_model("entity_attention_3d", ONNXEntityAttentionModel)  # Алиас для 3D
